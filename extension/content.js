@@ -1,0 +1,1769 @@
+﻿(function () {
+  const frameName = (window.name || "").toLowerCase();
+  const isTopWindow = window === window.top;
+  const isActionFrame = frameName === "d_act";
+  const isMenuFrame = frameName === "d_menu";
+  if (!isTopWindow && !isActionFrame && !isMenuFrame) return;
+  const TOGGLE_HIDDEN_KEY = "apehaHelperToggleHiddenV1";
+  if (isMenuFrame) {
+    if (window.__apehaHelperClockHookLoaded) return;
+    window.__apehaHelperClockHookLoaded = true;
+    const bindClockHotkey = () => {
+      const clock = document.getElementById("clock");
+      if (!clock) return false;
+      clock.addEventListener("contextmenu", (e) => {
+        if (!e.ctrlKey) return;
+        e.preventDefault();
+        e.stopPropagation();
+        localStorage.setItem(TOGGLE_HIDDEN_KEY, "0");
+        try {
+          if (window.top && window.top.frames && window.top.frames.d_act && window.top.frames.d_act.location) {
+            window.top.frames.d_act.location.reload();
+          }
+        } catch (_e) {}
+      }, true);
+      return true;
+    };
+    if (!bindClockHotkey()) {
+      let tries = 0;
+      const timer = window.setInterval(() => {
+        tries++;
+        if (bindClockHotkey() || tries > 30) window.clearInterval(timer);
+      }, 300);
+    }
+    return;
+  }
+  // In frameset arena layout render helper inside d_act frame,
+  // because top frameset document cannot display regular overlay UI.
+  if (isTopWindow && document.querySelector("frameset")) return;
+
+  const hasBattleContext = (() => {
+    try {
+      const href = (window.location && window.location.href ? window.location.href : "").toLowerCase();
+      if (window.frames && window.frames.d_act) return true;
+      if (window.frames && window.frames.d_menu) return true;
+      if (document.querySelector('frame[name="d_act"], iframe[name="d_act"]')) return true;
+      if (document.querySelector('frame[name="d_menu"], iframe[name="d_menu"]')) return true;
+      try {
+        if (window.top && window.top.frames && window.top.frames.d_menu) return true;
+      } catch (_e) {}
+      if (
+        href.includes("arena_room") ||
+        href.includes("castle_cid") ||
+        href.includes("/mbattle.html") ||
+        href.includes("mbattle.html?") ||
+        href.includes("/combat_bid_") ||
+        href.includes("/endbattle.html") ||
+        href.includes("/animate_bid_") ||
+        href.includes("/animate_all_")
+      ) return true;
+      return false;
+    } catch (_e) {
+      return true;
+    }
+  })();
+  if (!hasBattleContext) return;
+  if (window.__apehaHelperLoaded) return;
+  window.__apehaHelperLoaded = true;
+
+  const POS_KEY = "apehaHelperPosV1";
+  const PANEL_OPEN_KEY = "apehaHelperPanelOpenV1";
+  const WATCH_KEY = "apehaHelperWatchBlocksV2";
+  const WATCH_HL_KEY = "apehaHelperWatchHighlightFlagsV1";
+  const WATCH_TEAM_KEY = "apehaHelperWatchTeamModeV1";
+  const DEFAULT_ROWS = 5;
+  const DRAG_SNAP_RIGHT_PX = 14;
+
+  const root = document.createElement("div");
+  root.id = "apeha-helper-root";
+  root.className = "is-collapsed";
+  // Failsafe: keep toggle visible even if page CSS breaks our stylesheet.
+  root.style.position = "fixed";
+  root.style.right = "0";
+  root.style.top = "45%";
+  root.style.zIndex = "2147483000";
+
+  const toggle = document.createElement("button");
+  toggle.id = "apeha-helper-toggle";
+  toggle.type = "button";
+  toggle.textContent = "Helper";
+  toggle.className = "drag-handle";
+
+  const panel = document.createElement("div");
+  panel.id = "apeha-helper-panel";
+
+  const body = document.createElement("div");
+  body.id = "apeha-helper-body";
+
+  const watchArea = document.createElement("div");
+  watchArea.id = "apeha-helper-watch-area";
+
+
+  const blocksHost = document.createElement("div");
+  blocksHost.id = "apeha-helper-blocks";
+
+  const addRowBtn = document.createElement("button");
+  addRowBtn.id = "apeha-helper-add-row";
+  addRowBtn.type = "button";
+  addRowBtn.title = "Add row to current block";
+  addRowBtn.textContent = "+";
+
+  let watchBlocks = loadWatchBlocks();
+  let watchHighlightFlags = loadWatchHighlightFlags();
+  let watchTeamModes = loadWatchTeamModes();
+  let activeBlockIndex = 0;
+  let suppressClick = false;
+  let helperDisabled = localStorage.getItem(TOGGLE_HIDDEN_KEY) === "1";
+  let refreshTimerId = 0;
+  let currentBattleId = "";
+  const stickyBlackShield = new Set();
+  let sidePanelClosedBattleId = "";
+  let sidePanelPos = null;
+  const rosterCtrlClickBoundDocs = new WeakSet();
+  const mapCtrlClickBoundDocs = new WeakSet();
+  syncWatchStateShape();
+  saveWatchHighlightFlags();
+  syncTeamModesShape();
+  saveWatchTeamModes();
+
+  function normalizeNick(s) {
+    return (s || "")
+      .toLowerCase()
+      .replace(/ё/g, "е")
+      .replace(/\\(.)/g, "$1")
+      .replace(/[^a-zа-я0-9]+/gi, "")
+      .trim();
+  }
+
+  function toStringArray(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map((x) => (typeof x === "string" ? x : ""));
+  }
+
+  function normalizeBlocks(raw) {
+    if (!Array.isArray(raw) || raw.length === 0) {
+      return [new Array(DEFAULT_ROWS).fill("")];
+    }
+    const blocks = raw.map(toStringArray).filter((b) => b.length > 0);
+    if (blocks.length === 0) return [new Array(DEFAULT_ROWS).fill("")];
+    if (blocks[0].length < DEFAULT_ROWS) {
+      while (blocks[0].length < DEFAULT_ROWS) blocks[0].push("");
+    }
+    return blocks;
+  }
+
+  function loadWatchBlocks() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(WATCH_KEY) || "null");
+      if (parsed) return normalizeBlocks(parsed);
+
+      // Migration from old format (fixed 10 rows).
+      const old = JSON.parse(localStorage.getItem("apehaHelperWatchBlocksV1") || "null");
+      return normalizeBlocks(old);
+    } catch (_e) {
+      return [new Array(DEFAULT_ROWS).fill("")];
+    }
+  }
+
+  function saveWatchBlocks() {
+    localStorage.setItem(WATCH_KEY, JSON.stringify(watchBlocks));
+  }
+
+  function normalizeHighlightFlags(raw) {
+    if (!Array.isArray(raw) || raw.length === 0) {
+      return [new Array(DEFAULT_ROWS).fill(true)];
+    }
+    const flags = raw.map((block) => {
+      if (!Array.isArray(block) || block.length === 0) return [true];
+      return block.map((x) => x !== false);
+    });
+    if (flags[0].length < DEFAULT_ROWS) {
+      while (flags[0].length < DEFAULT_ROWS) flags[0].push(true);
+    }
+    return flags;
+  }
+
+  function loadWatchHighlightFlags() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(WATCH_HL_KEY) || "null");
+      return normalizeHighlightFlags(parsed);
+    } catch (_e) {
+      return [new Array(DEFAULT_ROWS).fill(true)];
+    }
+  }
+
+  function saveWatchHighlightFlags() {
+    localStorage.setItem(WATCH_HL_KEY, JSON.stringify(watchHighlightFlags));
+  }
+
+  function loadWatchTeamModes() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(WATCH_TEAM_KEY) || "null");
+      if (!Array.isArray(parsed) || !parsed.length) return [0];
+      return parsed.map((x) => (x === -1 || x === 1 ? x : 0));
+    } catch (_e) {
+      return [0];
+    }
+  }
+
+  function saveWatchTeamModes() {
+    localStorage.setItem(WATCH_TEAM_KEY, JSON.stringify(watchTeamModes));
+  }
+
+  function syncWatchStateShape() {
+    while (watchHighlightFlags.length < watchBlocks.length) watchHighlightFlags.push([]);
+    while (watchHighlightFlags.length > watchBlocks.length) watchHighlightFlags.pop();
+    watchBlocks.forEach((block, bi) => {
+      if (!Array.isArray(watchHighlightFlags[bi])) watchHighlightFlags[bi] = [];
+      while (watchHighlightFlags[bi].length < block.length) watchHighlightFlags[bi].push(true);
+      while (watchHighlightFlags[bi].length > block.length) watchHighlightFlags[bi].pop();
+    });
+  }
+
+  function syncTeamModesShape() {
+    while (watchTeamModes.length < watchBlocks.length) watchTeamModes.push(0);
+    while (watchTeamModes.length > watchBlocks.length) watchTeamModes.pop();
+  }
+
+  function isRowHighlightEnabled(blockIndex, rowIndex) {
+    syncWatchStateShape();
+    return watchHighlightFlags[blockIndex][rowIndex] !== false;
+  }
+
+  function isEndBattlePage(doc) {
+    try {
+      const href = (doc.location && doc.location.href ? doc.location.href : "").toLowerCase();
+      return href.includes("/endbattle.html");
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function finalizeSets(alive, dead) {
+    alive.forEach((nick) => {
+      if (dead.has(nick)) dead.delete(nick);
+    });
+    return { alive, dead };
+  }
+
+  function resolveBattleDocument() {
+    const candidates = [];
+    const pushDoc = (doc) => {
+      if (!doc) return;
+      if (!candidates.includes(doc)) candidates.push(doc);
+    };
+
+    pushDoc(document);
+    try {
+      pushDoc(window.parent && window.parent.frames && window.parent.frames.d_act && window.parent.frames.d_act.document);
+    } catch (_e) {}
+    try {
+      pushDoc(window.top && window.top.frames && window.top.frames.d_act && window.top.frames.d_act.document);
+    } catch (_e) {}
+
+    for (const doc of candidates) {
+      try {
+        const scripts = doc.querySelectorAll("script");
+        for (let i = 0; i < scripts.length; i++) {
+          const content = scripts[i].textContent || scripts[i].innerText || "";
+          if (content.includes("var UNBS") && content.includes("var DEAD")) return doc;
+        }
+      } catch (_e) {}
+    }
+
+    for (const doc of candidates) {
+      try {
+        if (doc.getElementById("aliveshow") || doc.getElementById("deadshow")) return doc;
+      } catch (_e) {}
+    }
+
+    return document;
+  }
+
+  function parseSetsFromBattleScript(doc) {
+    const alive = new Set();
+    const dead = new Set();
+    try {
+      const scripts = doc.querySelectorAll("script");
+      let battleScript = "";
+
+      for (let i = 0; i < scripts.length; i++) {
+        const content = scripts[i].textContent || scripts[i].innerText || "";
+        if (content.includes("var UNBS") && content.includes("var DEAD")) {
+          battleScript = content;
+          break;
+        }
+      }
+
+      if (!battleScript) return { alive, dead };
+
+      const deadMatch = battleScript.match(/var\s+DEAD\s*=\s*(\{[\s\S]*?\});/);
+      if (deadMatch && typeof deadMatch[1] === "string") {
+        const deadEntries = deadMatch[1].match(/nk:"[^"]+"/g) || [];
+        for (let i = 0; i < deadEntries.length; i++) {
+          const raw = deadEntries[i];
+          const nick = normalizeNick(raw.replace(/^nk:"/, "").replace(/"$/, ""));
+          if (nick) dead.add(nick);
+        }
+      }
+
+      const unbsMatch = battleScript.match(/var\s+UNBS\s*=\s*(\{[\s\S]*?\});/);
+      if (unbsMatch && typeof unbsMatch[1] === "string") {
+        const playerRegex = /(\d+):\{([^}]+)\}/g;
+        let p;
+        while ((p = playerRegex.exec(unbsMatch[1])) !== null) {
+          const playerData = p && typeof p[2] === "string" ? p[2] : "";
+          if (!playerData) continue;
+          const hpRaw = (playerData.match(/hp:("?-?\d+"?)/) || [])[1];
+          const rawNick = (playerData.match(/nk:"([^"]+)"/) || [])[1];
+          if (!rawNick) continue;
+          const nick = normalizeNick(rawNick);
+          if (!nick) continue;
+          const hp = hpRaw ? Number(String(hpRaw).replace(/"/g, "")) : NaN;
+          if (Number.isFinite(hp)) {
+            if (hp <= 0) dead.add(nick);
+            else alive.add(nick);
+          }
+        }
+      }
+    } catch (_e) {
+      return { alive, dead };
+    }
+
+    return finalizeSets(alive, dead);
+  }
+
+  function parseSetsFromWindowVars(doc) {
+    const alive = new Set();
+    const dead = new Set();
+    const attrName = "data-apeha-helper-battle";
+
+    try {
+      const script = doc.createElement("script");
+      script.textContent = `
+        (() => {
+          try {
+            const alive = [];
+            const dead = [];
+            const unbs = window.UNBS;
+            const deadObj = window.DEAD;
+
+            if (unbs && typeof unbs === "object") {
+              for (const k in unbs) {
+                const p = unbs[k];
+                if (!p || typeof p !== "object") continue;
+                const nick = typeof p.nk === "string" ? p.nk : "";
+                const hp = Number(p.hp);
+                if (!nick) continue;
+                if (Number.isFinite(hp)) {
+                  if (hp <= 0) dead.push(nick);
+                  else alive.push(nick);
+                }
+              }
+            }
+
+            if (deadObj && typeof deadObj === "object") {
+              for (const k in deadObj) {
+                const p = deadObj[k];
+                if (!p || typeof p !== "object") continue;
+                const nick = typeof p.nk === "string" ? p.nk : "";
+                if (nick) dead.push(nick);
+              }
+            }
+
+            document.documentElement.setAttribute(
+              "${attrName}",
+              JSON.stringify({ alive, dead })
+            );
+          } catch (_e) {
+            document.documentElement.setAttribute("${attrName}", "");
+          }
+        })();
+      `;
+      (doc.head || doc.documentElement).appendChild(script);
+      script.remove();
+
+      const raw = doc.documentElement.getAttribute(attrName) || "";
+      doc.documentElement.removeAttribute(attrName);
+      if (!raw) return { alive, dead };
+      const parsed = JSON.parse(raw);
+
+      if (Array.isArray(parsed.alive)) {
+        parsed.alive.forEach((nick) => {
+          const n = normalizeNick(nick);
+          if (n) alive.add(n);
+        });
+      }
+      if (Array.isArray(parsed.dead)) {
+        parsed.dead.forEach((nick) => {
+          const n = normalizeNick(nick);
+          if (n) dead.add(n);
+        });
+      }
+    } catch (_e) {
+      return { alive, dead };
+    }
+
+    return finalizeSets(alive, dead);
+  }
+
+  function parseSetsFromDom() {
+    const alive = new Set();
+    const dead = new Set();
+    const aliveNode = document.getElementById("aliveshow");
+    const deadNode = document.getElementById("deadshow");
+
+    if (aliveNode) {
+      const aliveLinks = aliveNode.querySelectorAll('a[class^="s"]:not([class^="s-"])');
+      aliveLinks.forEach((a) => {
+        const nick = normalizeNick(a.textContent);
+        if (nick) alive.add(nick);
+      });
+    }
+
+    if (deadNode) {
+      const deadLinks = deadNode.querySelectorAll('a[class^="s-"], span[class^="s-"]');
+      deadLinks.forEach((el) => {
+        const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!txt) return;
+        const parts = txt.split(" ");
+        if (parts.length > 1) {
+          dead.add(normalizeNick(parts.slice(1).join(" ")));
+        } else {
+          dead.add(normalizeNick(txt));
+        }
+      });
+    }
+
+    return finalizeSets(alive, dead);
+  }
+
+  function parseSetsFromDomDoc(doc) {
+    const alive = new Set();
+    const dead = new Set();
+    const aliveNode = doc.getElementById("aliveshow");
+    const deadNode = doc.getElementById("deadshow");
+
+    if (aliveNode) {
+      const aliveLinks = aliveNode.querySelectorAll('a[class^="s"]:not([class^="s-"])');
+      aliveLinks.forEach((a) => {
+        const nick = normalizeNick(a.textContent);
+        if (nick) alive.add(nick);
+      });
+    }
+
+    if (deadNode) {
+      const deadLinks = deadNode.querySelectorAll('a[class^="s-"], span[class^="s-"]');
+      deadLinks.forEach((el) => {
+        const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!txt) return;
+        const parts = txt.split(" ");
+        if (parts.length > 1) {
+          dead.add(normalizeNick(parts.slice(1).join(" ")));
+        } else {
+          dead.add(normalizeNick(txt));
+        }
+      });
+    }
+
+    return finalizeSets(alive, dead);
+  }
+
+  function getAliveDeadSets() {
+    const battleDoc = resolveBattleDocument();
+    const fromDom = parseSetsFromDomDoc(battleDoc);
+    if (isEndBattlePage(battleDoc)) return fromDom;
+    if (fromDom.alive.size || fromDom.dead.size) return fromDom;
+    const fromScript = parseSetsFromBattleScript(battleDoc);
+    if (fromScript.alive.size || fromScript.dead.size) return fromScript;
+    return parseSetsFromWindowVars(battleDoc);
+  }
+
+  function setInputStatus(input, mode) {
+    input.classList.remove("status-alive", "status-dead", "status-unknown");
+    input.classList.add(mode);
+  }
+
+  function getTrackedNickSet() {
+    const tracked = new Set();
+    watchBlocks.forEach((block, bi) => {
+      block.forEach((value, ri) => {
+        if (!isRowHighlightEnabled(bi, ri)) return;
+        const nick = normalizeNick(value);
+        if (nick && !isInvisibleNick(nick)) tracked.add(nick);
+      });
+    });
+    return tracked;
+  }
+
+  function extractNickDisplayFromMapTitle(title) {
+    let txt = (title || "").replace(/\[[^\]]*]\s*$/, "").trim();
+    if (!txt) return "";
+    const parts = txt.split(/\s+/);
+    if (parts.length > 1 && /^[a-zа-я]{1,3}$/i.test(parts[0])) {
+      txt = parts.slice(1).join(" ");
+    }
+    return txt.replace(/\s+/g, " ").trim();
+  }
+
+  function extractNickFromMapTitle(title) {
+    return normalizeNick(extractNickDisplayFromMapTitle(title));
+  }
+
+  function isInvisibleNick(nick) {
+    return nick === normalizeNick("Невидимка");
+  }
+
+  function getAlwaysTrackedNickSet() {
+    const tracked = new Set();
+    watchBlocks.forEach((block) => {
+      block.forEach((value) => {
+        const nick = normalizeNick(value);
+        if (nick && !isInvisibleNick(nick)) tracked.add(nick);
+      });
+    });
+    return tracked;
+  }
+
+  function getActiveTeamMode() {
+    syncTeamModesShape();
+    return watchTeamModes[activeBlockIndex] || 0; // -1 blue, 0 none, 1 red
+  }
+
+  function getNickDisplayMap(doc, icons) {
+    const out = new Map();
+    const pri = new Map();
+    if (!doc) return out;
+
+    const put = (raw, priority) => {
+      const display = String(raw || "").replace(/\s+/g, " ").trim();
+      if (!display) return;
+      const key = normalizeNick(display);
+      if (!key || isInvisibleNick(key)) return;
+      const currentPri = pri.has(key) ? pri.get(key) : 999;
+      const currentDisplay = out.get(key) || "";
+      const shouldReplace =
+        priority < currentPri ||
+        (priority === currentPri && display.length > currentDisplay.length);
+      if (!shouldReplace) return;
+      pri.set(key, priority);
+      out.set(key, display);
+    };
+
+    (icons || []).forEach((img) => {
+      put(extractNickDisplayFromMapTitle(img.getAttribute("title") || ""), 1);
+    });
+
+    const alive = doc.getElementById("aliveshow");
+    const dead = doc.getElementById("deadshow");
+    const collectRoster = (container, inDeadList) => {
+      if (!container) return;
+      container.querySelectorAll("a,span").forEach((el) => {
+        put(extractNickFromRosterElement(el, inDeadList), 2);
+      });
+    };
+    collectRoster(alive, false);
+    collectRoster(dead, true);
+
+    const attrName = "data-apeha-helper-display-map-fallback";
+    try {
+      const script = doc.createElement("script");
+      script.textContent = `
+        (() => {
+          try {
+            const out = [];
+            const add = (obj) => {
+              if (!obj || typeof obj !== "object") return;
+              for (const k in obj) {
+                const p = obj[k];
+                if (!p || typeof p !== "object") continue;
+                if (typeof p.nk !== "string") continue;
+                out.push(p.nk);
+              }
+            };
+            add(window.UNBS);
+            add(window.DEAD);
+            document.documentElement.setAttribute("${attrName}", JSON.stringify(out));
+          } catch (_e) {
+            document.documentElement.setAttribute("${attrName}", "");
+          }
+        })();
+      `;
+      (doc.head || doc.documentElement).appendChild(script);
+      script.remove();
+      const raw = doc.documentElement.getAttribute(attrName) || "";
+      doc.documentElement.removeAttribute(attrName);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((nick) => put(nick, 3));
+        }
+      }
+    } catch (_e) {}
+
+    return out;
+  }
+
+  function getNickTeamMap() {
+    const map = new Map();
+    const stats = {
+      aliveS0: 0,
+      aliveS1: 0,
+      deadS0: 0,
+      deadS1: 0,
+      totalS0: 0,
+      totalS1: 0,
+      fallback0: 0,
+      fallback1: 0
+    };
+    const doc = resolveBattleDocument();
+    if (!doc) return { map, stats };
+    const attrName = "data-apeha-helper-team-map-fallback";
+
+    const parseTeamClass = (className) => {
+      const m = String(className || "").match(/(?:^|\s)s([01])(?:\s|$)/);
+      if (!m) return null;
+      const sd = Number(m[1]);
+      return sd === 0 || sd === 1 ? sd : null;
+    };
+
+    const collectFromNode = (node, source) => {
+      if (!node) return;
+      const els = node.querySelectorAll("a.s0,a.s1,span.s0,span.s1");
+      els.forEach((el) => {
+        const sd = parseTeamClass(el.className);
+        if (sd === null) return;
+        const nick = normalizeNick(el.textContent || "");
+        if (!nick || isInvisibleNick(nick)) return;
+        if (source === "dead") {
+          if (sd === 0) stats.deadS0++;
+          else stats.deadS1++;
+        } else {
+          if (sd === 0) stats.aliveS0++;
+          else stats.aliveS1++;
+        }
+        map.set(nick, sd);
+      });
+    };
+
+    collectFromNode(doc.getElementById("deadshow"), "dead");
+    collectFromNode(doc.getElementById("aliveshow"), "alive");
+
+    try {
+      const script = doc.createElement("script");
+      script.textContent = `
+        (() => {
+          try {
+            const out = {};
+            const add = (obj) => {
+              if (!obj || typeof obj !== "object") return;
+              for (const k in obj) {
+                const p = obj[k];
+                if (!p || typeof p !== "object") continue;
+                if (typeof p.nk !== "string") continue;
+                const sd = Number(p.sd);
+                if (!Number.isFinite(sd)) continue;
+                out[p.nk] = sd;
+              }
+            };
+            add(window.UNBS);
+            add(window.DEAD);
+            document.documentElement.setAttribute("${attrName}", JSON.stringify(out));
+          } catch (_e) {
+            document.documentElement.setAttribute("${attrName}", "");
+          }
+        })();
+      `;
+      (doc.head || doc.documentElement).appendChild(script);
+      script.remove();
+
+      const raw = doc.documentElement.getAttribute(attrName) || "";
+      doc.documentElement.removeAttribute(attrName);
+      if (!raw) {
+        map.forEach((sd) => {
+          if (sd === 0) stats.totalS0++;
+          else if (sd === 1) stats.totalS1++;
+        });
+        return { map, stats };
+      }
+      const parsed = JSON.parse(raw);
+      let fb0 = 0;
+      let fb1 = 0;
+      Object.keys(parsed || {}).forEach((rawNick) => {
+        const nick = normalizeNick(rawNick);
+        if (!nick || isInvisibleNick(nick)) return;
+        const sd = Number(parsed[rawNick]);
+        if (!Number.isFinite(sd)) return;
+        if (sd === 0) fb0++;
+        if (sd === 1) fb1++;
+        if (!map.has(nick) && (sd === 0 || sd === 1)) map.set(nick, sd);
+      });
+      stats.fallback0 = fb0;
+      stats.fallback1 = fb1;
+    } catch (_e) {
+      map.forEach((sd) => {
+        if (sd === 0) stats.totalS0++;
+        else if (sd === 1) stats.totalS1++;
+      });
+      return { map, stats };
+    }
+    map.forEach((sd) => {
+      if (sd === 0) stats.totalS0++;
+      else if (sd === 1) stats.totalS1++;
+    });
+    return { map, stats };
+  }
+
+  function getCurrentRoundContext(doc) {
+    const logsNode = doc && doc.getElementById ? doc.getElementById("logs") : null;
+    if (!logsNode) return { lines: [], linesNorm: [], text: "" };
+    const text = (logsNode.innerText || logsNode.textContent || "").replace(/\r/g, "");
+    if (!text) return { lines: [], linesNorm: [], text: "" };
+
+    let lines = text
+      .split("\n")
+      .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    if (!lines.length) return { lines: [], linesNorm: [], text: "" };
+
+    const getRoundNo = (line) => {
+      const raw = String(line || "");
+      const mRaw = raw.match(/раунд\s*(?:№|#)?\s*(\d+)/i);
+      if (mRaw && mRaw[1]) return Number(mRaw[1]);
+      const norm = normalizeNick(raw);
+      const mNorm = norm.match(/раунд(\d+)/i);
+      if (mNorm && mNorm[1]) return Number(mNorm[1]);
+      return NaN;
+    };
+
+    const markers = [];
+    lines.forEach((line, idx) => {
+      const no = getRoundNo(line);
+      if (Number.isFinite(no)) markers.push({ idx, no });
+    });
+
+    const scoreSegment = (segment) => {
+      if (!segment || !segment.length) return -1;
+      const tokens = [
+        "прокля",
+        "клич",
+        "панцир",
+        "оживить соратника",
+        "вмешался в бой",
+        "заморож",
+        "сошел с ума",
+        "сошла с ума",
+        "сошли с ума",
+        "испугал",
+        "испуган",
+        "иммунитет к боевой магии"
+      ].map(normalizeNick);
+      let score = 0;
+      segment.forEach((line) => {
+        const ln = normalizeNick(line);
+        if (!ln) return;
+        score += 0.1;
+        tokens.forEach((token) => {
+          if (ln.includes(token)) score += 2;
+        });
+      });
+      return score;
+    };
+
+    if (markers.length) {
+      const currentRoundNo = markers.reduce((max, m) => (m.no > max ? m.no : max), -Infinity);
+      const currentMarkers = markers.filter((m) => m.no === currentRoundNo);
+      const markerIdx = currentMarkers.reduce((min, m) => (m.idx < min ? m.idx : min), lines.length);
+      const nextMarkerIdx = markers
+        .filter((m) => m.idx > markerIdx)
+        .reduce((min, m) => (m.idx < min ? m.idx : min), lines.length);
+
+      const candidateTop = lines.slice(0, markerIdx + 1);
+      const candidateDown = lines.slice(markerIdx, nextMarkerIdx);
+      const topScore = scoreSegment(candidateTop);
+      const downScore = scoreSegment(candidateDown);
+      lines = downScore > topScore ? candidateDown : candidateTop;
+    } else {
+      lines = lines.slice(0, Math.min(lines.length, 100));
+    }
+
+    return {
+      lines,
+      linesNorm: lines.map((line) => normalizeNick(line)),
+      text: lines.join("\n")
+    };
+  }
+
+  function detectBattleId(doc) {
+    try {
+      const href = (doc.location && doc.location.href ? doc.location.href : "").toLowerCase();
+      const m = href.match(/(?:combat_bid_|animate_bid_|bid=)(\d+)/);
+      if (m && m[1]) return m[1];
+    } catch (_e) {}
+
+    const attrName = "data-apeha-helper-bid";
+    try {
+      const script = doc.createElement("script");
+      script.textContent = `
+        (() => {
+          try {
+            const bid = Number(window.BID);
+            document.documentElement.setAttribute("${attrName}", Number.isFinite(bid) ? String(bid) : "");
+          } catch (_e) {
+            document.documentElement.setAttribute("${attrName}", "");
+          }
+        })();
+      `;
+      (doc.head || doc.documentElement).appendChild(script);
+      script.remove();
+      const raw = doc.documentElement.getAttribute(attrName) || "";
+      doc.documentElement.removeAttribute(attrName);
+      if (raw) return raw;
+    } catch (_e) {}
+
+    try {
+      return (doc.location && doc.location.href ? doc.location.href : "").toLowerCase();
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  function syncBattleScope(doc) {
+    const bid = detectBattleId(doc);
+    if (bid && bid !== currentBattleId) {
+      currentBattleId = bid;
+      stickyBlackShield.clear();
+      sidePanelClosedBattleId = "";
+      sidePanelPos = null;
+    }
+  }
+
+  function ensureMapHighlightStyle(doc) {
+    const styleId = "apeha-helper-map-highlight-style";
+    if (doc.getElementById(styleId)) return;
+    const style = doc.createElement("style");
+    style.id = styleId;
+    style.textContent =
+      ".apeha-helper-map-target{" +
+      "background-color:rgba(255,255,0,0.78)!important;" +
+      "box-shadow:0 0 0 5px #ffff00,0 0 22px 7px rgba(255,255,0,1)!important;" +
+      "border-radius:50%!important;}" +
+      ".apeha-helper-map-target-revive{" +
+      "background-color:rgba(255,64,64,0.72)!important;" +
+      "box-shadow:0 0 0 5px #ff2a2a,0 0 22px 7px rgba(255,36,36,1)!important;" +
+      "border-radius:50%!important;}" +
+      ".apeha-helper-map-badges{position:absolute;pointer-events:none;z-index:2147483001;overflow:visible;}" +
+      ".apeha-helper-map-badge{position:absolute;display:inline-flex;align-items:center;justify-content:center;font:700 10px/10px Tahoma,Verdana,sans-serif;text-shadow:0 0 2px rgba(255,255,255,.7);}" +
+      ".apeha-helper-map-badge.shield-blue{left:0;top:0;width:15px;height:15px;clip-path:polygon(50% 100%,10% 62%,10% 8%,90% 8%,90% 62%);border:1px solid #d8f0ff;background:#178dff;box-shadow:0 0 5px #29a7ff;}" +
+      ".apeha-helper-map-badge.shield-black{right:0;top:0;width:15px;height:15px;clip-path:polygon(50% 100%,10% 62%,10% 8%,90% 8%,90% 62%);border:1px solid #d0d0d0;background:#111;box-shadow:0 0 5px rgba(0,0,0,.8);}" +
+      ".apeha-helper-map-badge.letter-p,.apeha-helper-map-badge.letter-k{left:1px;right:1px;top:1px;bottom:1px;width:auto;height:auto;font-size:24px;font-weight:900;line-height:1;display:flex;align-items:center;justify-content:center;text-shadow:0 0 2px rgba(255,255,255,.95),1px 0 0 currentColor,-1px 0 0 currentColor,0 1px 0 currentColor,0 -1px 0 currentColor,1px 1px 0 currentColor,-1px -1px 0 currentColor,1px -1px 0 currentColor,-1px 1px 0 currentColor;}" +
+      ".apeha-helper-map-badge.letter-p{color:#0f5dff;}" +
+      ".apeha-helper-map-badge.letter-k{color:#1aaf2c;}" +
+      ".apeha-helper-map-badge.mad-face{left:50%;bottom:-2px;transform:translateX(-50%);width:13px;height:13px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#ffe57a,#ffad2f 65%,#ff7a00);border:1px solid #8d3200;box-shadow:0 0 7px rgba(255,155,0,.95);}" +
+      ".apeha-helper-map-badge.mad-face::before{content:'';position:absolute;left:2px;top:4px;width:2px;height:2px;border-radius:50%;background:#5f1c00;box-shadow:6px -1px 0 #5f1c00;}" +
+      ".apeha-helper-map-badge.mad-face::after{content:'';position:absolute;left:2px;top:8px;width:8px;height:2px;border-radius:2px;background:linear-gradient(90deg,#5f1c00 0 15%,transparent 15% 35%,#5f1c00 35% 55%,transparent 55% 75%,#5f1c00 75% 100%);}" +
+      "#apeha-helper-side-panel{position:absolute;min-width:210px;max-width:280px;background:#f4e5bf;border:1px solid #c9b07f;border-radius:6px;padding:6px;color:#6f1515;font:700 11px/1.3 Tahoma,Verdana,sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.2);z-index:2147483002;}" +
+      "#apeha-helper-side-panel .section{margin-bottom:4px;}" +
+      "#apeha-helper-side-panel .section:last-child{margin-bottom:0;}" +
+      "#apeha-helper-side-panel .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;cursor:move;user-select:none;}" +
+      "#apeha-helper-side-panel .close{border:1px solid #bda572;background:linear-gradient(#efe2be,#dcc595);color:#8f1414;border-radius:3px;width:16px;height:16px;line-height:14px;padding:0;cursor:pointer;}" +
+      "#apeha-helper-side-panel .k{color:#7f0d0d;}" +
+      "#apeha-helper-side-panel .v{font-weight:700;color:#2f1c00;}" +
+      "#apeha-helper-side-panel .nick{color:#183d8f;text-decoration:underline;cursor:pointer;}";
+    (doc.head || doc.documentElement).appendChild(style);
+  }
+
+  function findActorsInLine(lineNorm, tokenNorm, nicks) {
+    const idx = lineNorm.indexOf(tokenNorm);
+    const head = idx >= 0 ? lineNorm.slice(0, idx) : lineNorm;
+    const actors = [];
+    nicks.forEach((nick) => {
+      if (head.includes(nick)) actors.push(nick);
+    });
+    if (actors.length) return actors;
+    const fallback = [];
+    nicks.forEach((nick) => {
+      if (lineNorm.includes(nick)) fallback.push(nick);
+    });
+    return fallback;
+  }
+
+  function getCurrentRoundState(allNicks) {
+    const blueShield = new Set();
+    const blackShieldCurrent = new Set();
+    const letterP = new Set();
+    const letterK = new Set();
+    const mad = new Set();
+    const frozen = new Set();
+    const feared = new Set();
+    const revived = new Set();
+
+    if (!allNicks || !allNicks.size) {
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, mad, frozen, feared, revived };
+    }
+
+    const battleDoc = resolveBattleDocument();
+    if (!battleDoc) {
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, mad, frozen, feared, revived };
+    }
+
+    syncBattleScope(battleDoc);
+    const round = getCurrentRoundContext(battleDoc);
+    const lines = round.linesNorm;
+    if (!lines.length) {
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, mad, frozen, feared, revived };
+    }
+
+    const nicks = Array.from(allNicks).filter((nick) => !isInvisibleNick(nick));
+    const blueTokens = [
+      "Магический панцирь",
+      "Магический панцирь I ступени",
+      "Магический панцирь II ступени",
+      "Увернуться от удара",
+      "Увернуться от удара I ступени",
+      "Увернуться от удара II ступени",
+      "Веерная защита",
+      "Веерная защита I ступени",
+      "Веерная защита II ступени"
+    ].map(normalizeNick);
+    const blackToken = normalizeNick("иммунитет к боевой магии");
+    const pToken = normalizeNick("проклясть противника");
+    const kToken = normalizeNick("боевой клич");
+    const reviveToken = normalizeNick("оживить соратника");
+    const useScrollToken = normalizeNick("использовал свиток");
+    const interveneToken = normalizeNick("вмешался в бой");
+    const madnessTokens = [
+      normalizeNick("сошел с ума"),
+      normalizeNick("сошла с ума"),
+      normalizeNick("сошли с ума")
+    ];
+
+    lines.forEach((lineNorm, idx) => {
+      if (!lineNorm) return;
+
+      blueTokens.forEach((token) => {
+        if (!lineNorm.includes(token)) return;
+        findActorsInLine(lineNorm, token, nicks).forEach((nick) => blueShield.add(nick));
+      });
+      if (lineNorm.includes(blackToken)) {
+        findActorsInLine(lineNorm, blackToken, nicks).forEach((nick) => blackShieldCurrent.add(nick));
+      }
+      if (lineNorm.includes(pToken)) {
+        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => letterP.add(nick));
+      }
+      if (lineNorm.includes(kToken)) {
+        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => letterK.add(nick));
+      }
+      if (madnessTokens.some((token) => lineNorm.includes(token))) {
+        nicks.forEach((nick) => {
+          if (lineNorm.includes(nick)) mad.add(nick);
+        });
+      }
+      if (lineNorm.includes("заморож")) {
+        nicks.forEach((nick) => {
+          if (lineNorm.includes(nick)) frozen.add(nick);
+        });
+      }
+      if (lineNorm.includes("испугал") || lineNorm.includes("испуган")) {
+        nicks.forEach((nick) => {
+          if (lineNorm.includes(nick)) feared.add(nick);
+        });
+      }
+
+      if (!lineNorm.includes(interveneToken) || idx + 1 >= lines.length) return;
+      const nextLine = lines[idx + 1];
+      if (!nextLine.includes(useScrollToken) || !nextLine.includes(reviveToken)) return;
+      findActorsInLine(lineNorm, interveneToken, nicks).forEach((nick) => revived.add(nick));
+    });
+
+    blackShieldCurrent.forEach((nick) => stickyBlackShield.add(nick));
+    return {
+      blueShield,
+      blackShield: new Set(stickyBlackShield),
+      letterP,
+      letterK,
+      mad,
+      frozen,
+      feared,
+      revived
+    };
+  }
+
+  function filterNicksByTeam(set, teamMap, selectedTeam) {
+    const out = new Set();
+    if (!set || !set.size) return out;
+    set.forEach((nick) => {
+      if (selectedTeam === null) {
+        out.add(nick);
+        return;
+      }
+      if (teamMap.get(nick) === selectedTeam) out.add(nick);
+    });
+    return out;
+  }
+
+  function renderBattleSidePanel(doc, selectedTeam, teamMap, roundState, revivedDisabled, displayNameMap) {
+    const mapImg = doc.getElementById("map");
+    if (!mapImg) return;
+    const layerHost = doc.body || doc.documentElement;
+    if (!layerHost) return;
+    const bid = detectBattleId(doc) || currentBattleId || "";
+    if (sidePanelClosedBattleId && sidePanelClosedBattleId === bid) return;
+
+    let sideLayer = doc.getElementById("apeha-helper-side-layer");
+    if (!sideLayer) {
+      sideLayer = doc.createElement("div");
+      sideLayer.id = "apeha-helper-side-layer";
+      layerHost.appendChild(sideLayer);
+    }
+    sideLayer.style.position = "absolute";
+    sideLayer.style.left = "0";
+    sideLayer.style.top = "0";
+    sideLayer.style.zIndex = "2147483002";
+    sideLayer.style.pointerEvents = "none";
+
+    let panelNode = doc.getElementById("apeha-helper-side-panel");
+    if (!panelNode) {
+      panelNode = doc.createElement("div");
+      panelNode.id = "apeha-helper-side-panel";
+      sideLayer.appendChild(panelNode);
+    }
+    panelNode.style.pointerEvents = "auto";
+
+    const mapRect = mapImg.getBoundingClientRect ? mapImg.getBoundingClientRect() : { left: 0, top: 0 };
+    const scrollX = doc.defaultView ? (doc.defaultView.scrollX || doc.defaultView.pageXOffset || 0) : 0;
+    const scrollY = doc.defaultView ? (doc.defaultView.scrollY || doc.defaultView.pageYOffset || 0) : 0;
+    if (sidePanelPos && sidePanelPos.bid === bid) {
+      panelNode.style.left = `${sidePanelPos.left}px`;
+      panelNode.style.top = `${sidePanelPos.top}px`;
+    } else {
+      const left = mapRect.left + scrollX + (mapImg.offsetWidth || mapRect.width || 0) + 20;
+      const top = mapRect.top + scrollY;
+      panelNode.style.left = `${Math.max(0, Math.round(left))}px`;
+      panelNode.style.top = `${Math.max(0, Math.round(top))}px`;
+    }
+
+    const escapeHtml = (s) => String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+    const toList = (set) => {
+      const items = Array.from(filterNicksByTeam(set, teamMap, selectedTeam));
+      if (!items.length) return "-";
+      return items
+        .map((nickKey) => {
+          const nickDisplay = (displayNameMap && displayNameMap.get(nickKey)) || nickKey;
+          const safe = escapeHtml(nickDisplay);
+          const href = `/info.html?nick=${encodeURIComponent(nickDisplay)}`;
+          return `<a class="nick" data-nick="${safe}" href="${href}" target="_blank" rel="noopener noreferrer">${safe}</a>`;
+        })
+        .join(", ");
+    };
+
+    const sections = [
+      ["прокля", toList(roundState.letterP)],
+      ["клич", toList(roundState.letterK)],
+      ["сведен с ума", toList(roundState.mad)],
+      ["заморожен", toList(roundState.frozen)],
+      ["неуязвим", toList(roundState.blueShield)],
+      ["иммунитет", toList(roundState.blackShield)],
+      ["поднят в прокле", toList(revivedDisabled)]
+    ];
+
+    panelNode.innerHTML = [
+      "<div class=\"head\"><span>Статусы</span><button type=\"button\" class=\"close\" title=\"Закрыть\">×</button></div>",
+      ...sections.map(([k, v]) => `<div class="section"><span class="k">${k}:</span> <span class="v">${v}</span></div>`)
+    ].join("");
+
+    const closeBtn = panelNode.querySelector(".close");
+    if (closeBtn) {
+      closeBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        sidePanelClosedBattleId = bid;
+        panelNode.remove();
+      }, { once: true });
+    }
+
+    panelNode.querySelectorAll(".nick").forEach((a) => {
+      a.addEventListener("click", (e) => {
+        if (!e.ctrlKey || e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const nick = a.getAttribute("data-nick") || "";
+        addNickToActiveBlock(nick);
+      });
+    });
+
+    const head = panelNode.querySelector(".head");
+    if (head) {
+      head.onmousedown = (e) => {
+        if (e.button !== 0) return;
+        const rect = panelNode.getBoundingClientRect();
+        const sX = doc.defaultView ? (doc.defaultView.scrollX || doc.defaultView.pageXOffset || 0) : 0;
+        const sY = doc.defaultView ? (doc.defaultView.scrollY || doc.defaultView.pageYOffset || 0) : 0;
+        const shiftX = (e.clientX + sX) - (rect.left + sX);
+        const shiftY = (e.clientY + sY) - (rect.top + sY);
+
+        const onMove = (ev) => {
+          const mvX = doc.defaultView ? (doc.defaultView.scrollX || doc.defaultView.pageXOffset || 0) : 0;
+          const mvY = doc.defaultView ? (doc.defaultView.scrollY || doc.defaultView.pageYOffset || 0) : 0;
+          const left = (ev.clientX + mvX) - shiftX;
+          const top = (ev.clientY + mvY) - shiftY;
+          panelNode.style.left = `${Math.max(0, Math.round(left))}px`;
+          panelNode.style.top = `${Math.max(0, Math.round(top))}px`;
+          sidePanelPos = {
+            bid,
+            left: Math.max(0, Math.round(left)),
+            top: Math.max(0, Math.round(top))
+          };
+        };
+        const onUp = () => {
+          doc.removeEventListener("mousemove", onMove);
+          doc.removeEventListener("mouseup", onUp);
+        };
+        doc.addEventListener("mousemove", onMove);
+        doc.addEventListener("mouseup", onUp);
+      };
+    }
+  }
+
+  function clearBattleDecorations(doc) {
+    if (!doc) return;
+    doc.querySelectorAll(".apeha-helper-map-badges").forEach((el) => el.remove());
+    doc.querySelectorAll('img[id^="pr_"]').forEach((img) => {
+      img.classList.remove("apeha-helper-map-target", "apeha-helper-map-target-revive");
+    });
+    const side = doc.getElementById("apeha-helper-side-panel");
+    if (side) side.remove();
+    const layer = doc.getElementById("apeha-helper-side-layer");
+    if (layer) layer.remove();
+  }
+
+  function renderIconBadges(doc, img, badgeSets, nick) {
+    if (!nick || isInvisibleNick(nick)) return;
+    const badges = [];
+    if (badgeSets.blackShield.has(nick)) badges.push({ cls: "shield-black" });
+    if (badgeSets.blueShield.has(nick)) badges.push({ cls: "shield-blue" });
+    if (badgeSets.letterP.has(nick)) badges.push({ cls: "letter-p", text: "П" });
+    if (badgeSets.letterK.has(nick)) badges.push({ cls: "letter-k", text: "К" });
+    if (badgeSets.mad.has(nick)) badges.push({ cls: "mad-face" });
+    if (!badges.length) return;
+
+    const host = doc.createElement("span");
+    host.className = "apeha-helper-map-badges";
+    host.style.left = `${img.offsetLeft}px`;
+    host.style.top = `${img.offsetTop}px`;
+    host.style.width = `${Math.max(12, img.offsetWidth || 0)}px`;
+    host.style.height = `${Math.max(12, img.offsetHeight || 0)}px`;
+
+    badges.forEach((b) => {
+      const node = doc.createElement("span");
+      node.className = `apeha-helper-map-badge ${b.cls}`;
+      if (b.text) node.textContent = b.text;
+      host.appendChild(node);
+    });
+
+    (img.parentElement || doc.body || doc.documentElement).appendChild(host);
+  }
+
+  function refreshMapHighlights() {
+    if (helperDisabled) return;
+    const battleDoc = resolveBattleDocument();
+    if (!battleDoc) return;
+    const icons = battleDoc.querySelectorAll('img[id^="pr_"][title]');
+    if (!icons.length) {
+      clearBattleDecorations(battleDoc);
+      return;
+    }
+
+    ensureMapHighlightStyle(battleDoc);
+    const tracked = getTrackedNickSet();
+    const teamMode = getActiveTeamMode();
+    const teamData = getNickTeamMap();
+    let selectedTeam = null;
+    if (teamMode === -1) selectedTeam = 0;
+    if (teamMode === 1) selectedTeam = 1;
+    const teamMap = teamData.map;
+
+    battleDoc.querySelectorAll(".apeha-helper-map-badges").forEach((el) => el.remove());
+
+    const allNicks = new Set();
+    const nickToImg = new Map();
+    icons.forEach((img) => {
+      const nick = extractNickFromMapTitle(img.getAttribute("title") || "");
+      if (!nick || isInvisibleNick(nick)) return;
+      allNicks.add(nick);
+      if (!nickToImg.has(nick)) nickToImg.set(nick, img);
+    });
+    const displayNameMap = getNickDisplayMap(battleDoc, icons);
+
+    const roundState = getCurrentRoundState(allNicks);
+    const revivedDisabled = new Set();
+    roundState.revived.forEach((nick) => {
+      const img = nickToImg.get(nick);
+      if (!img) return;
+      const src = String(img.getAttribute("src") || "").toLowerCase();
+      if (/(^|\/)pb[01]d\.(png|gif)(\?|$)/.test(src) || /pb[01]d\.(png|gif)/.test(src)) {
+        revivedDisabled.add(nick);
+      }
+    });
+
+    const teamVisibleNicks = new Set();
+    allNicks.forEach((nick) => {
+      if (selectedTeam === null || teamMap.get(nick) === selectedTeam) teamVisibleNicks.add(nick);
+    });
+
+    const displayBadgeSets = {
+      blackShield: filterNicksByTeam(roundState.blackShield, teamMap, selectedTeam),
+      blueShield: filterNicksByTeam(roundState.blueShield, teamMap, selectedTeam),
+      letterP: filterNicksByTeam(roundState.letterP, teamMap, selectedTeam),
+      letterK: filterNicksByTeam(roundState.letterK, teamMap, selectedTeam),
+      mad: filterNicksByTeam(roundState.mad, teamMap, selectedTeam)
+    };
+
+    icons.forEach((img) => {
+      const nick = extractNickFromMapTitle(img.getAttribute("title") || "");
+      const marked = nick && !isInvisibleNick(nick) && tracked.has(nick);
+      const isRevivedDisabled = nick && revivedDisabled.has(nick) && teamVisibleNicks.has(nick);
+      img.classList.toggle("apeha-helper-map-target", !!marked);
+      img.classList.toggle("apeha-helper-map-target-revive", !!isRevivedDisabled);
+      if (nick && teamVisibleNicks.has(nick)) renderIconBadges(battleDoc, img, displayBadgeSets, nick);
+    });
+
+    renderBattleSidePanel(battleDoc, selectedTeam, teamMap, roundState, revivedDisabled, displayNameMap);
+  }
+
+  function getRoundEffects(trackedNicks) {
+    const shield = new Set();
+    const blackShield = new Set();
+    const mad = new Set();
+    const frozen = new Set();
+    const feared = new Set();
+    if (!trackedNicks || !trackedNicks.size) return { shield, blackShield, mad, frozen, feared };
+
+    const state = getCurrentRoundState(trackedNicks);
+    trackedNicks.forEach((nick) => {
+      if (state.blueShield.has(nick)) shield.add(nick);
+      if (state.blackShield.has(nick)) blackShield.add(nick);
+      if (state.mad.has(nick)) mad.add(nick);
+      if (state.frozen.has(nick)) frozen.add(nick);
+      if (state.feared.has(nick)) feared.add(nick);
+    });
+
+    return { shield, blackShield, mad, frozen, feared };
+  }
+  function setRowEffects(input, effectSets, nick) {
+    const row = input && input.parentElement;
+    if (!row) return;
+    const host = row.querySelector(".apeha-helper-row-effects");
+    if (!host) return;
+    host.textContent = "";
+    if (!nick || isInvisibleNick(nick)) return;
+
+    const appendIcon = (cls, title) => {
+      const icon = document.createElement("span");
+      icon.className = `apeha-helper-effect ${cls}`;
+      icon.title = title;
+      host.appendChild(icon);
+    };
+
+    if (effectSets.shield.has(nick)) appendIcon("effect-shield", "Неуязвимость");
+    if (effectSets.blackShield.has(nick)) appendIcon("effect-black-shield", "Иммунитет к боевой магии");
+    if (effectSets.mad.has(nick)) appendIcon("effect-mad", "Сведен с ума");
+    if (effectSets.frozen.has(nick)) appendIcon("effect-frozen", "Заморожен");
+    if (effectSets.feared.has(nick)) appendIcon("effect-feared", "Испугался");
+  }
+
+  function extractNickFromRosterElement(el, inDeadList) {
+    const txt = (el && el.textContent ? el.textContent : "").replace(/\s+/g, " ").trim();
+    if (!txt) return "";
+    if (!inDeadList) return txt;
+    const parts = txt.split(" ");
+    if (parts.length > 1) return parts.slice(1).join(" ");
+    return txt;
+  }
+
+  function addNickToActiveBlock(rawNick) {
+    const cleaned = String(rawNick || "").replace(/\s+/g, " ").trim();
+    const nick = normalizeNick(cleaned);
+    if (!nick || isInvisibleNick(nick)) return false;
+    if (!watchBlocks[activeBlockIndex]) watchBlocks[activeBlockIndex] = new Array(DEFAULT_ROWS).fill("");
+    if (!watchHighlightFlags[activeBlockIndex]) watchHighlightFlags[activeBlockIndex] = [];
+
+    const exists = watchBlocks[activeBlockIndex].some((v) => normalizeNick(v) === nick);
+    if (exists) return false;
+
+    let targetRow = watchBlocks[activeBlockIndex].findIndex((v) => !normalizeNick(v));
+    if (targetRow === -1) {
+      targetRow = watchBlocks[activeBlockIndex].length;
+      watchBlocks[activeBlockIndex].push(cleaned);
+      watchHighlightFlags[activeBlockIndex].push(true);
+    } else {
+      watchBlocks[activeBlockIndex][targetRow] = cleaned;
+      watchHighlightFlags[activeBlockIndex][targetRow] = watchHighlightFlags[activeBlockIndex][targetRow] !== false;
+    }
+
+    syncWatchStateShape();
+    saveWatchBlocks();
+    saveWatchHighlightFlags();
+    renderWatchBlocks();
+    refreshInputStatuses();
+    return true;
+  }
+
+  function ensureRosterCtrlClickBinding() {
+    const battleDoc = resolveBattleDocument();
+    if (!battleDoc || rosterCtrlClickBoundDocs.has(battleDoc)) return;
+    rosterCtrlClickBoundDocs.add(battleDoc);
+
+    battleDoc.addEventListener("click", (e) => {
+      if (!e || e.button !== 0 || !e.ctrlKey) return;
+      const target = e.target;
+      if (!target || typeof target.closest !== "function") return;
+      const container = target.closest("#aliveshow, #deadshow");
+      if (!container) return;
+      const entry = target.closest("a,span");
+      if (!entry) return;
+
+      const rawNick = extractNickFromRosterElement(entry, container.id === "deadshow");
+      if (!rawNick) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      addNickToActiveBlock(rawNick);
+    }, true);
+  }
+
+  function ensureMapCtrlClickBinding() {
+    const battleDoc = resolveBattleDocument();
+    if (!battleDoc || mapCtrlClickBoundDocs.has(battleDoc)) return;
+    mapCtrlClickBoundDocs.add(battleDoc);
+
+    battleDoc.addEventListener("click", (e) => {
+      if (!e || e.button !== 0 || !e.ctrlKey) return;
+      const target = e.target;
+      if (!target || typeof target.closest !== "function") return;
+      const icon = target.closest('img[id^="pr_"][title]');
+      if (!icon) return;
+
+      const rawNick = extractNickDisplayFromMapTitle(icon.getAttribute("title") || "");
+      if (!rawNick) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      addNickToActiveBlock(rawNick);
+    }, true);
+  }
+
+  function refreshInputStatuses() {
+    if (helperDisabled) {
+      clearBattleDecorations(resolveBattleDocument());
+      return;
+    }
+    ensureRosterCtrlClickBinding();
+    ensureMapCtrlClickBinding();
+    let sets = { alive: new Set(), dead: new Set() };
+    try {
+      sets = getAliveDeadSets();
+    } catch (_e) {}
+    const inputs = blocksHost.querySelectorAll("input[data-block][data-row]");
+    let aliveCount = 0;
+    let deadCount = 0;
+    let unknownCount = 0;
+    const tracked = new Set();
+
+    inputs.forEach((input) => {
+      const nick = normalizeNick(input.value);
+      if (nick) tracked.add(nick);
+    });
+    const effectSets = getRoundEffects(tracked);
+
+    inputs.forEach((input) => {
+      const nick = normalizeNick(input.value);
+      if (!nick) {
+        setInputStatus(input, "status-unknown");
+        setRowEffects(input, effectSets, "");
+        unknownCount++;
+        return;
+      }
+      if (sets.alive.has(nick)) {
+        setInputStatus(input, "status-alive");
+        aliveCount++;
+      } else if (sets.dead.has(nick)) {
+        setInputStatus(input, "status-dead");
+        deadCount++;
+      } else {
+        setInputStatus(input, "status-unknown");
+        unknownCount++;
+      }
+      setRowEffects(input, effectSets, nick);
+    });
+
+    refreshMapHighlights();
+  }
+
+  function focusBlock(index) {
+    activeBlockIndex = Math.max(0, Math.min(index, watchBlocks.length - 1));
+    const blocks = blocksHost.querySelectorAll(".apeha-helper-watch-block");
+    blocks.forEach((el, i) => {
+      el.classList.toggle("active", i === activeBlockIndex);
+    });
+  }
+
+  function normalizeHelperWidth() {
+    panel.style.removeProperty("width");
+    body.style.removeProperty("width");
+    watchArea.style.removeProperty("width");
+    blocksHost.style.removeProperty("width");
+  }
+
+  function renderWatchBlocks() {
+    syncWatchStateShape();
+    syncTeamModesShape();
+    blocksHost.innerHTML = "";
+
+    watchBlocks.forEach((block, blockIndex) => {
+      const blockEl = document.createElement("div");
+      blockEl.className = "apeha-helper-watch-block";
+      if (blockIndex === activeBlockIndex) blockEl.classList.add("active");
+      blockEl.addEventListener("mousedown", () => focusBlock(blockIndex));
+
+      const blockHead = document.createElement("div");
+      blockHead.className = "apeha-helper-watch-block-head";
+
+      const teamSwitch = document.createElement("div");
+      teamSwitch.className = "apeha-helper-team-switch";
+      const currentTeamMode = (watchTeamModes[blockIndex] === -1 || watchTeamModes[blockIndex] === 1) ? watchTeamModes[blockIndex] : 0;
+      const modes = [
+        { v: -1, cls: "team-blue" },
+        { v: 0, cls: "team-none" },
+        { v: 1, cls: "team-red" }
+      ];
+      modes.forEach((item) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = `apeha-helper-team-btn ${item.cls}`;
+        if (currentTeamMode === item.v) b.classList.add("active");
+        b.addEventListener("click", () => {
+          watchTeamModes[blockIndex] = item.v;
+          saveWatchTeamModes();
+          renderWatchBlocks();
+        });
+        teamSwitch.appendChild(b);
+      });
+
+      const blockActions = document.createElement("div");
+      blockActions.className = "apeha-helper-watch-actions";
+
+      const addBlockBtn = document.createElement("button");
+      addBlockBtn.type = "button";
+      addBlockBtn.className = "apeha-helper-mini";
+      addBlockBtn.title = "Add block";
+      addBlockBtn.textContent = "+";
+      addBlockBtn.addEventListener("click", () => {
+        watchBlocks.push(new Array(DEFAULT_ROWS).fill(""));
+        watchHighlightFlags.push(new Array(DEFAULT_ROWS).fill(true));
+        watchTeamModes.push(0);
+        activeBlockIndex = watchBlocks.length - 1;
+        saveWatchBlocks();
+        saveWatchHighlightFlags();
+        saveWatchTeamModes();
+        renderWatchBlocks();
+      });
+      blockActions.appendChild(addBlockBtn);
+
+      const clearBtn = document.createElement("button");
+      clearBtn.type = "button";
+      clearBtn.className = "apeha-helper-mini";
+      clearBtn.title = "Clear block";
+      clearBtn.textContent = "C";
+      clearBtn.addEventListener("click", () => {
+        watchBlocks[blockIndex] = new Array(Math.max(DEFAULT_ROWS, watchBlocks[blockIndex].length)).fill("");
+        watchHighlightFlags[blockIndex] = new Array(watchBlocks[blockIndex].length).fill(true);
+        saveWatchBlocks();
+        saveWatchHighlightFlags();
+        saveWatchTeamModes();
+        renderWatchBlocks();
+      });
+      blockActions.appendChild(clearBtn);
+
+      if (blockIndex > 0) {
+        const removeBlockBtn = document.createElement("button");
+        removeBlockBtn.type = "button";
+        removeBlockBtn.className = "apeha-helper-mini";
+        removeBlockBtn.title = "Remove block";
+        removeBlockBtn.textContent = "-";
+        removeBlockBtn.addEventListener("click", () => {
+          watchBlocks.splice(blockIndex, 1);
+          watchHighlightFlags.splice(blockIndex, 1);
+          watchTeamModes.splice(blockIndex, 1);
+          if (activeBlockIndex >= watchBlocks.length) activeBlockIndex = watchBlocks.length - 1;
+          saveWatchBlocks();
+          saveWatchHighlightFlags();
+          saveWatchTeamModes();
+          renderWatchBlocks();
+        });
+        blockActions.appendChild(removeBlockBtn);
+      }
+
+      blockHead.appendChild(teamSwitch);
+      blockHead.appendChild(blockActions);
+      blockEl.appendChild(blockHead);
+
+      block.forEach((value, rowIndex) => {
+        const row = document.createElement("div");
+        row.className = "apeha-helper-watch-row";
+
+        const rowCheck = document.createElement("input");
+        rowCheck.type = "checkbox";
+        rowCheck.className = "apeha-helper-row-check";
+        rowCheck.checked = isRowHighlightEnabled(blockIndex, rowIndex);
+        rowCheck.title = "Highlight on map";
+        rowCheck.addEventListener("change", () => {
+          watchHighlightFlags[blockIndex][rowIndex] = rowCheck.checked;
+          saveWatchHighlightFlags();
+          refreshMapHighlights();
+        });
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "apeha-helper-watch-input status-unknown";
+        input.placeholder = `Nick ${rowIndex + 1}`;
+        input.value = value || "";
+        input.setAttribute("data-block", String(blockIndex));
+        input.setAttribute("data-row", String(rowIndex));
+        input.addEventListener("focus", () => focusBlock(blockIndex));
+        input.addEventListener("blur", () => {
+          watchBlocks[blockIndex][rowIndex] = input.value;
+          saveWatchBlocks();
+          refreshInputStatuses();
+        });
+        input.addEventListener("keydown", (e) => {
+          if (e.key !== "Enter") return;
+          e.preventDefault();
+          watchBlocks[blockIndex][rowIndex] = input.value;
+          saveWatchBlocks();
+          refreshInputStatuses();
+          input.blur();
+        });
+
+        const effects = document.createElement("span");
+        effects.className = "apeha-helper-row-effects";
+
+        const clearRowBtn = document.createElement("button");
+        clearRowBtn.type = "button";
+        clearRowBtn.className = "apeha-helper-row-clear";
+        clearRowBtn.title = "Delete row";
+        clearRowBtn.textContent = "x";
+        clearRowBtn.addEventListener("click", () => {
+          if (watchBlocks[blockIndex].length > 1) {
+            watchBlocks[blockIndex].splice(rowIndex, 1);
+            watchHighlightFlags[blockIndex].splice(rowIndex, 1);
+          } else {
+            watchBlocks[blockIndex][0] = "";
+            watchHighlightFlags[blockIndex][0] = true;
+          }
+          saveWatchBlocks();
+          saveWatchHighlightFlags();
+          renderWatchBlocks();
+        });
+
+        row.appendChild(rowCheck);
+        row.appendChild(input);
+        row.appendChild(effects);
+        row.appendChild(clearRowBtn);
+        blockEl.appendChild(row);
+      });
+
+      blocksHost.appendChild(blockEl);
+    });
+
+    focusBlock(activeBlockIndex);
+    refreshInputStatuses();
+    normalizeHelperWidth();
+  }
+
+  addRowBtn.addEventListener("click", () => {
+    if (!watchBlocks[activeBlockIndex]) watchBlocks[activeBlockIndex] = [];
+    watchBlocks[activeBlockIndex].push("");
+    if (!watchHighlightFlags[activeBlockIndex]) watchHighlightFlags[activeBlockIndex] = [];
+    watchHighlightFlags[activeBlockIndex].push(true);
+    saveWatchBlocks();
+    saveWatchHighlightFlags();
+    renderWatchBlocks();
+  });
+
+  function savePanelOpen(isOpen) {
+    localStorage.setItem(PANEL_OPEN_KEY, isOpen ? "1" : "0");
+  }
+
+  function isPanelOpenSaved() {
+    return localStorage.getItem(PANEL_OPEN_KEY) === "1";
+  }
+
+  const openPanel = () => {
+    root.classList.remove("is-collapsed");
+    savePanelOpen(true);
+  };
+  const closePanel = () => {
+    root.classList.add("is-collapsed");
+    savePanelOpen(false);
+  };
+  const togglePanel = () => {
+    root.classList.toggle("is-collapsed");
+    savePanelOpen(!root.classList.contains("is-collapsed"));
+  };
+
+  function applyHiddenState(hidden) {
+    helperDisabled = !!hidden;
+    localStorage.setItem(TOGGLE_HIDDEN_KEY, helperDisabled ? "1" : "0");
+    if (helperDisabled) {
+      root.style.display = "none";
+      clearBattleDecorations(resolveBattleDocument());
+    } else {
+      root.style.display = "";
+      refreshInputStatuses();
+    }
+  }
+
+  toggle.addEventListener("click", () => {
+    if (helperDisabled) return;
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    togglePanel();
+  });
+
+  toggle.addEventListener("contextmenu", (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+    applyHiddenState(true);
+  }, true);
+
+  document.addEventListener("contextmenu", (e) => {
+    if (!helperDisabled || !e.ctrlKey) return;
+    const target = e.target;
+    if (target && typeof target.closest === "function" && target.closest("#apeha-helper-root")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    applyHiddenState(false);
+  }, true);
+
+  function applyPosition(pos) {
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return;
+    const w = Math.max(36, root.offsetWidth || 36);
+    const h = Math.max(24, root.offsetHeight || 24);
+    const maxX = Math.max(0, window.innerWidth - w);
+    const maxY = Math.max(0, window.innerHeight - h);
+    const x = clamp(Math.round(pos.x), 0, maxX);
+    const y = clamp(Math.round(pos.y), 0, maxY);
+    if (maxX - x <= DRAG_SNAP_RIGHT_PX) {
+      root.style.left = "auto";
+      root.style.right = "0";
+    } else {
+      root.style.left = `${x}px`;
+      root.style.right = "auto";
+    }
+    root.style.top = `${y}px`;
+  }
+
+  function readPosition() {
+    try {
+      return JSON.parse(localStorage.getItem(POS_KEY) || "null");
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function savePosition(x, y) {
+    localStorage.setItem(POS_KEY, JSON.stringify({ x, y }));
+  }
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(v, max));
+  }
+
+  function startDrag(ev) {
+    const rect = root.getBoundingClientRect();
+    const shiftX = ev.clientX - rect.left;
+    const shiftY = ev.clientY - rect.top;
+    let moved = 0;
+    let snappedRight = false;
+
+    function onMove(e) {
+      moved++;
+      const maxX = Math.max(0, window.innerWidth - root.offsetWidth);
+      const maxY = Math.max(0, window.innerHeight - root.offsetHeight);
+      const x = clamp(e.clientX - shiftX, 0, maxX);
+      const y = clamp(e.clientY - shiftY, 0, maxY);
+      snappedRight = maxX - x <= DRAG_SNAP_RIGHT_PX;
+      if (snappedRight) {
+        root.style.left = "auto";
+        root.style.right = "0";
+      } else {
+        root.style.left = `${x}px`;
+        root.style.right = "auto";
+      }
+      root.style.top = `${y}px`;
+    }
+
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      const rect2 = root.getBoundingClientRect();
+      const maxX = Math.max(0, window.innerWidth - root.offsetWidth);
+      const x = snappedRight ? maxX : Math.round(rect2.left);
+      savePosition(x, Math.round(rect2.top));
+      if (moved > 2) suppressClick = true;
+    }
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  toggle.addEventListener("mousedown", startDrag);
+  watchArea.appendChild(blocksHost);
+  body.appendChild(watchArea);
+  body.appendChild(addRowBtn);
+  panel.appendChild(body);
+  root.appendChild(toggle);
+  root.appendChild(panel);
+
+  (document.body || document.documentElement).appendChild(root);
+  applyPosition(readPosition());
+  if (!readPosition()) {
+    root.style.right = "0";
+    root.style.left = "auto";
+  }
+  if (isPanelOpenSaved()) openPanel();
+  else closePanel();
+  renderWatchBlocks();
+  refreshTimerId = window.setInterval(() => {
+    if (!helperDisabled) refreshInputStatuses();
+  }, 1000);
+  if (helperDisabled) applyHiddenState(true);
+})();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

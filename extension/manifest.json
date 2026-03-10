@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Apeha Helper",
+  "version": "0.1.0",
+  "description": "Local UI helper for apeha.ru",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.apeha.ru/*",
+        "*://apeha.ru/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
+}
