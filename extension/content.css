@@ -80,6 +80,30 @@
   cursor: pointer;
 }
 
+#apeha-helper-clear-cache {
+  margin-top: 4px;
+  width: 100%;
+  height: 22px;
+  border: 1px solid #bda572;
+  background: linear-gradient(#efe2be, #dcc595);
+  border-radius: 4px;
+  color: #8f1414;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+#apeha-helper-debug {
+  margin: 4px 0 0;
+  padding: 4px;
+  min-height: 42px;
+  white-space: pre-wrap;
+  font: 10px/1.25 Consolas, monospace;
+  color: #5f2600;
+  background: #f5ecd5;
+  border: 1px solid #c9b07f;
+  border-radius: 4px;
+}
+
 .apeha-helper-watch-block {
   border: 1px solid #c9b07f;
   background: #efdfb8;

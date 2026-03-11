@@ -5,6 +5,7 @@
   const isMenuFrame = frameName === "d_menu";
   if (!isTopWindow && !isActionFrame && !isMenuFrame) return;
   const TOGGLE_HIDDEN_KEY = "apehaHelperToggleHiddenV1";
+  const ROUND_STATUS_CACHE_KEY = "apehaHelperRoundStatusCacheV1";
   if (isMenuFrame) {
     if (window.__apehaHelperClockHookLoaded) return;
     window.__apehaHelperClockHookLoaded = true;
@@ -108,6 +109,15 @@
   addRowBtn.title = "Add row to current block";
   addRowBtn.textContent = "+";
 
+  const clearCacheBtn = document.createElement("button");
+  clearCacheBtn.id = "apeha-helper-clear-cache";
+  clearCacheBtn.type = "button";
+  clearCacheBtn.title = "Очистить кэш П/К";
+  clearCacheBtn.textContent = "Очистить кэш";
+
+  const debugBox = document.createElement("pre");
+  debugBox.id = "apeha-helper-debug";
+
   let watchBlocks = loadWatchBlocks();
   let watchHighlightFlags = loadWatchHighlightFlags();
   let watchTeamModes = loadWatchTeamModes();
@@ -167,6 +177,121 @@
 
   function saveWatchBlocks() {
     localStorage.setItem(WATCH_KEY, JSON.stringify(watchBlocks));
+  }
+
+  function loadRoundStatusCache() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(ROUND_STATUS_CACHE_KEY) || "{}");
+      if (!parsed || typeof parsed !== "object") return {};
+      const out = {};
+      Object.keys(parsed).forEach((battleId) => {
+        const battleEntry = parsed[battleId];
+        if (!battleEntry || typeof battleEntry !== "object") return;
+        const rounds = {};
+        if (battleEntry.rounds && typeof battleEntry.rounds === "object") {
+          Object.keys(battleEntry.rounds).forEach((roundKey) => {
+            const entry = battleEntry.rounds[roundKey];
+            if (!entry || typeof entry !== "object") return;
+            rounds[String(roundKey)] = {
+              letterP: toStringArray(entry.letterP),
+              letterK: toStringArray(entry.letterK)
+            };
+          });
+        } else if (Number.isFinite(Number(battleEntry.roundNo))) {
+          rounds[String(Number(battleEntry.roundNo))] = {
+            letterP: toStringArray(battleEntry.letterP),
+            letterK: toStringArray(battleEntry.letterK)
+          };
+        }
+        const teams = {};
+        if (battleEntry.teams && typeof battleEntry.teams === "object") {
+          Object.keys(battleEntry.teams).forEach((teamKey) => {
+            const entry = battleEntry.teams[teamKey];
+            if (!entry || typeof entry !== "object") return;
+            const teamNo = Number(teamKey);
+            if (teamNo !== 0 && teamNo !== 1) return;
+            const lastCurseRoundNo = Number(entry.lastCurseRoundNo);
+            teams[String(teamNo)] = {
+              lastCurseRoundNo: Number.isFinite(lastCurseRoundNo) ? lastCurseRoundNo : NaN,
+              letterP: toStringArray(entry.letterP),
+              letterK: toStringArray(entry.letterK)
+            };
+          });
+        }
+        out[battleId] = { rounds, teams };
+      });
+      return out;
+    } catch (_e) {
+      return {};
+    }
+  }
+
+  function saveRoundStatusCache(cache) {
+    try {
+      localStorage.setItem(ROUND_STATUS_CACHE_KEY, JSON.stringify(cache || {}));
+    } catch (_e) {}
+  }
+
+  function writeRoundStatusCache(cache, battleId, roundNo, letterPSet, letterKSet) {
+    if (!cache || !battleId || !Number.isFinite(roundNo)) return;
+    if ((!letterPSet || !letterPSet.size) && (!letterKSet || !letterKSet.size)) return;
+    if (!cache[battleId] || typeof cache[battleId] !== "object") cache[battleId] = { rounds: {} };
+    if (!cache[battleId].rounds || typeof cache[battleId].rounds !== "object") cache[battleId].rounds = {};
+
+    const roundKey = String(roundNo);
+    const existing = cache[battleId].rounds[roundKey] || {};
+    const nextLetterP = letterPSet && letterPSet.size ? Array.from(letterPSet) : toStringArray(existing.letterP);
+    const nextLetterK = letterKSet && letterKSet.size ? Array.from(letterKSet) : toStringArray(existing.letterK);
+    if (!nextLetterP.length && !nextLetterK.length) return;
+
+    cache[battleId].rounds[roundKey] = {
+      letterP: nextLetterP,
+      letterK: nextLetterK
+    };
+
+    const roundKeys = Object.keys(cache[battleId].rounds)
+      .map((key) => Number(key))
+      .filter((key) => Number.isFinite(key))
+      .sort((a, b) => b - a);
+    roundKeys.slice(8).forEach((oldRoundNo) => {
+      delete cache[battleId].rounds[String(oldRoundNo)];
+    });
+  }
+
+  function writeTeamCurseCache(cache, battleId, teamId, roundNo, letterPSet, letterKSet) {
+    if (!cache || !battleId || !Number.isFinite(roundNo)) return;
+    if (teamId !== 0 && teamId !== 1) return;
+    if (!letterPSet || !letterPSet.size) return;
+    if (!cache[battleId] || typeof cache[battleId] !== "object") cache[battleId] = { rounds: {}, teams: {} };
+    if (!cache[battleId].teams || typeof cache[battleId].teams !== "object") cache[battleId].teams = {};
+    cache[battleId].teams[String(teamId)] = {
+      lastCurseRoundNo: roundNo,
+      letterP: Array.from(letterPSet || []),
+      letterK: Array.from(letterKSet || [])
+    };
+  }
+
+  function getBattleViewInfo(doc) {
+    let href = "";
+    let pathname = "";
+    try {
+      href = String(doc && doc.location && doc.location.href ? doc.location.href : "");
+      pathname = String(doc && doc.location && doc.location.pathname ? doc.location.pathname : "");
+    } catch (_e) {}
+    const lowerHref = href.toLowerCase();
+    const isAnimateHistory = /\/animate_bid_\d+_round_\d+_nobut_\d+\.html/.test(lowerHref);
+    const offsetMatch = lowerHref.match(/_round_(\d+)_nobut_/);
+    const roundOffset = offsetMatch && offsetMatch[1] ? Number(offsetMatch[1]) : NaN;
+    const battleId = detectBattleId(doc);
+    const viewKey = isAnimateHistory
+      ? `${battleId || pathname}|${pathname}|${Number.isFinite(roundOffset) ? roundOffset : "na"}`
+      : String(battleId || pathname || href || "");
+    return {
+      battleId: String(battleId || ""),
+      viewKey,
+      isAnimateHistory,
+      roundOffset
+    };
   }
 
   function normalizeHighlightFlags(raw) {
@@ -716,15 +841,23 @@
 
   function getCurrentRoundContext(doc) {
     const logsNode = doc && doc.getElementById ? doc.getElementById("logs") : null;
-    if (!logsNode) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
+    if (!logsNode) return { lines: [], linesNorm: [], htmlLines: [], text: "", previousLines: [], previousLinesNorm: [], previousHtmlLines: [], previousText: "", roundNo: NaN, roundNoCurrent: NaN, isRoundMarkerOnly: false, hasCurrentEvents: false };
     const text = (logsNode.innerText || logsNode.textContent || "").replace(/\r/g, "");
-    if (!text) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
+    if (!text) return { lines: [], linesNorm: [], htmlLines: [], text: "", previousLines: [], previousLinesNorm: [], previousHtmlLines: [], previousText: "", roundNo: NaN, roundNoCurrent: NaN, isRoundMarkerOnly: false, hasCurrentEvents: false };
+    const html = String(logsNode.innerHTML || "").replace(/\r/g, "");
 
-    let lines = text
+    const allLines = text
       .split("\n")
       .map((line) => String(line || "").replace(/\s+/g, " ").trim())
       .filter(Boolean);
-    if (!lines.length) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
+    const allHtmlLines = html
+      .split(/<br\s*\/?>/i)
+      .map((line) => String(line || "").trim())
+      .filter(Boolean);
+    if (!allLines.length) return { lines: [], linesNorm: [], htmlLines: [], text: "", previousLines: [], previousLinesNorm: [], previousHtmlLines: [], previousText: "", roundNo: NaN, roundNoCurrent: NaN, isRoundMarkerOnly: false, hasCurrentEvents: false };
+
+    let lines = allLines.slice();
+    let htmlLines = allHtmlLines.slice();
 
     const getRoundNo = (line) => {
       const raw = String(line || "");
@@ -745,34 +878,47 @@
     // events are always at the top and the first visible round marker closes
     // the current block.
     let previousLines = [];
+    let previousHtmlLines = [];
+    let roundNo = NaN;
+    let isRoundMarkerOnly = false;
     if (roundIndexes.length) {
       const firstRoundIdx = roundIndexes[0];
+      roundNo = getRoundNo(lines[firstRoundIdx]);
       lines = lines.slice(0, firstRoundIdx + 1);
+      htmlLines = htmlLines.slice(0, firstRoundIdx + 1);
       if (roundIndexes.length > 1) {
         const secondRoundIdx = roundIndexes[1];
-        previousLines = text
-          .split("\n")
-          .map((line) => String(line || "").replace(/\s+/g, " ").trim())
-          .filter(Boolean)
-          .slice(firstRoundIdx + 1, secondRoundIdx + 1);
+        previousLines = allLines.slice(firstRoundIdx + 1, secondRoundIdx + 1);
+        previousHtmlLines = allHtmlLines.slice(firstRoundIdx + 1, secondRoundIdx + 1);
       } else {
-        previousLines = text
-          .split("\n")
-          .map((line) => String(line || "").replace(/\s+/g, " ").trim())
-          .filter(Boolean)
-          .slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, text.split("\n").length));
+        previousLines = allLines.slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, allLines.length));
+        previousHtmlLines = allHtmlLines.slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, allHtmlLines.length));
       }
     } else {
       lines = lines.slice(0, Math.min(lines.length, 100));
+      htmlLines = htmlLines.slice(0, Math.min(htmlLines.length, 100));
     }
+
+    const nonMarkerLines = lines.filter((line) => {
+      if (!line) return false;
+      return !Number.isFinite(getRoundNo(line));
+    });
+    isRoundMarkerOnly = nonMarkerLines.length === 0;
+    const hasCurrentEvents = nonMarkerLines.length > 0;
 
     return {
       lines,
       linesNorm: lines.map((line) => normalizeNick(line)),
+      htmlLines,
       text: lines.join("\n"),
       previousLines,
       previousLinesNorm: previousLines.map((line) => normalizeNick(line)),
-      previousText: previousLines.join("\n")
+      previousHtmlLines,
+      previousText: previousLines.join("\n"),
+      roundNo,
+      roundNoCurrent: roundNo,
+      isRoundMarkerOnly,
+      hasCurrentEvents
     };
   }
 
@@ -872,6 +1018,24 @@
     return fallback;
   }
 
+  function decodeHtmlText(html) {
+    const el = document.createElement("div");
+    el.innerHTML = String(html || "");
+    return (el.textContent || el.innerText || "").replace(/\s+/g, " ").trim();
+  }
+
+  function inferTeamFromLogHtmlLine(lineHtml, nickNorm) {
+    if (!lineHtml || !nickNorm) return null;
+    const re = /<font[^>]*class=["']s([01])["'][^>]*>([\s\S]*?)<\/font>/ig;
+    let m;
+    while ((m = re.exec(String(lineHtml)))) {
+      const teamId = Number(m[1]);
+      const rawNick = decodeHtmlText(m[2]);
+      if ((teamId === 0 || teamId === 1) && normalizeNick(rawNick) === nickNorm) return teamId;
+    }
+    return null;
+  }
+
   function getCurrentRoundState(allNicks) {
     const blueShield = new Set();
     const blackShieldCurrent = new Set();
@@ -879,27 +1043,44 @@
     const letterK = new Set();
     const letterPPrev = new Set();
     const letterKPrev = new Set();
+    const pkTeamHints = new Map();
+    const debug = {
+      roundNo: NaN,
+      battleId: "",
+      teams: { 0: null, 1: null },
+      letterP: [],
+      letterK: [],
+      letterPPrev: [],
+      letterKPrev: []
+    };
     const mad = new Set();
     const frozen = new Set();
     const feared = new Set();
     const revived = new Set();
 
     if (!allNicks || !allNicks.size) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, pkTeamHints, mad, frozen, feared, revived, debug };
     }
 
     const battleDoc = resolveBattleDocument();
     if (!battleDoc) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, pkTeamHints, mad, frozen, feared, revived, debug };
     }
 
     syncBattleScope(battleDoc);
     const round = getCurrentRoundContext(battleDoc);
     const lines = round.linesNorm;
+    const htmlLines = round.htmlLines || [];
     if (!lines.length) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, pkTeamHints, mad, frozen, feared, revived, debug };
     }
     const previousLines = round.previousLinesNorm || [];
+    const previousHtmlLines = round.previousHtmlLines || [];
+    const roundNo = Number.isFinite(round.roundNoCurrent) ? round.roundNoCurrent : (Number.isFinite(round.roundNo) ? round.roundNo : NaN);
+    const battleId = detectBattleId(battleDoc) || currentBattleId || "";
+    const teamMap = getNickTeamMap().map;
+    debug.roundNo = roundNo;
+    debug.battleId = battleId;
 
     const nicks = Array.from(allNicks).filter((nick) => !isInvisibleNick(nick));
     const blueTokens = [
@@ -936,10 +1117,22 @@
         findActorsInLine(lineNorm, blackToken, nicks).forEach((nick) => blackShieldCurrent.add(nick));
       }
       if (lineNorm.includes(pToken)) {
-        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => letterP.add(nick));
+        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => {
+          letterP.add(nick);
+          if (!pkTeamHints.has(nick)) {
+            const inferred = inferTeamFromLogHtmlLine(htmlLines[idx], nick);
+            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
+          }
+        });
       }
       if (lineNorm.includes(kToken)) {
-        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => letterK.add(nick));
+        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => {
+          letterK.add(nick);
+          if (!pkTeamHints.has(nick)) {
+            const inferred = inferTeamFromLogHtmlLine(htmlLines[idx], nick);
+            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
+          }
+        });
       }
       if (madnessTokens.some((token) => lineNorm.includes(token))) {
         nicks.forEach((nick) => {
@@ -968,14 +1161,105 @@
       if (lineNorm.includes(pToken)) {
         findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => {
           if (!letterP.has(nick)) letterPPrev.add(nick);
+          if (!pkTeamHints.has(nick)) {
+            const inferred = inferTeamFromLogHtmlLine(previousHtmlLines[idx], nick);
+            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
+          }
         });
       }
       if (lineNorm.includes(kToken)) {
         findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => {
           if (!letterK.has(nick)) letterKPrev.add(nick);
+          if (!pkTeamHints.has(nick)) {
+            const inferred = inferTeamFromLogHtmlLine(previousHtmlLines[idx], nick);
+            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
+          }
         });
       }
     });
+
+    if (Number.isFinite(roundNo) && battleId) {
+      const cache = loadRoundStatusCache();
+      const currentLetterPByTeam = new Map([[0, new Set()], [1, new Set()]]);
+      const currentLetterKByTeam = new Map([[0, new Set()], [1, new Set()]]);
+      const previousLetterPByTeam = new Map([[0, new Set()], [1, new Set()]]);
+      const previousLetterKByTeam = new Map([[0, new Set()], [1, new Set()]]);
+
+      letterP.forEach((nick) => {
+        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
+        if (teamId === 0 || teamId === 1) {
+          currentLetterPByTeam.get(teamId).add(nick);
+          pkTeamHints.set(nick, teamId);
+        }
+      });
+      letterK.forEach((nick) => {
+        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
+        if (teamId === 0 || teamId === 1) {
+          currentLetterKByTeam.get(teamId).add(nick);
+          pkTeamHints.set(nick, teamId);
+        }
+      });
+      letterPPrev.forEach((nick) => {
+        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
+        if (teamId === 0 || teamId === 1) {
+          previousLetterPByTeam.get(teamId).add(nick);
+          pkTeamHints.set(nick, teamId);
+        }
+      });
+      letterKPrev.forEach((nick) => {
+        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
+        if (teamId === 0 || teamId === 1) {
+          previousLetterKByTeam.get(teamId).add(nick);
+          pkTeamHints.set(nick, teamId);
+        }
+      });
+
+      const cachedBattle = cache[battleId];
+      const cachedTeams = cachedBattle && cachedBattle.teams && typeof cachedBattle.teams === "object" ? cachedBattle.teams : {};
+      debug.teams[0] = cachedTeams["0"] ? Number(cachedTeams["0"].lastCurseRoundNo) : null;
+      debug.teams[1] = cachedTeams["1"] ? Number(cachedTeams["1"].lastCurseRoundNo) : null;
+      ["0", "1"].forEach((teamKey) => {
+        const teamEntry = cachedTeams[teamKey];
+        if (!teamEntry) return;
+        const delta = roundNo - Number(teamEntry.lastCurseRoundNo);
+        if (delta !== 1 && delta !== 2) return;
+        toStringArray(teamEntry.letterP).forEach((nick) => {
+          const normalized = normalizeNick(nick);
+          if (!normalized || letterP.has(normalized)) return;
+          pkTeamHints.set(normalized, Number(teamKey));
+          letterPPrev.add(normalized);
+        });
+        toStringArray(teamEntry.letterK).forEach((nick) => {
+          const normalized = normalizeNick(nick);
+          if (!normalized || letterK.has(normalized)) return;
+          pkTeamHints.set(normalized, Number(teamKey));
+          letterKPrev.add(normalized);
+        });
+      });
+
+      writeRoundStatusCache(cache, battleId, roundNo, letterP, letterK);
+      if (roundNo > 1 && (letterPPrev.size || letterKPrev.size)) {
+        writeRoundStatusCache(cache, battleId, roundNo - 1, letterPPrev, letterKPrev);
+      }
+      [0, 1].forEach((teamId) => {
+        const teamLetterP = currentLetterPByTeam.get(teamId);
+        if (!teamLetterP || !teamLetterP.size) return;
+        writeTeamCurseCache(cache, battleId, teamId, roundNo, teamLetterP, currentLetterKByTeam.get(teamId));
+      });
+      if (roundNo > 1) {
+        [0, 1].forEach((teamId) => {
+          const prevTeamLetterP = previousLetterPByTeam.get(teamId);
+          if (!prevTeamLetterP || !prevTeamLetterP.size) return;
+          writeTeamCurseCache(cache, battleId, teamId, roundNo - 1, prevTeamLetterP, previousLetterKByTeam.get(teamId));
+        });
+      }
+      saveRoundStatusCache(cache);
+    }
+
+    debug.letterP = Array.from(letterP);
+    debug.letterK = Array.from(letterK);
+    debug.letterPPrev = Array.from(letterPPrev);
+    debug.letterKPrev = Array.from(letterKPrev);
 
     blackShieldCurrent.forEach((nick) => stickyBlackShield.add(nick));
     return {
@@ -985,11 +1269,31 @@
       letterK,
       letterPPrev,
       letterKPrev,
+      pkTeamHints,
       mad,
       frozen,
       feared,
-      revived
+      revived,
+      debug
     };
+  }
+
+  function renderDebugInfo(roundState) {
+    if (!debugBox) return;
+    const debug = roundState && roundState.debug ? roundState.debug : null;
+    if (!debug) {
+      debugBox.textContent = "";
+      return;
+    }
+    const fmt = (arr) => Array.isArray(arr) && arr.length ? arr.join(", ") : "-";
+    debugBox.textContent = [
+      `r=${Number.isFinite(debug.roundNo) ? debug.roundNo : "na"} bid=${debug.battleId || "-"}`,
+      `t0=${debug.teams && debug.teams[0] !== null ? debug.teams[0] : "-"} t1=${debug.teams && debug.teams[1] !== null ? debug.teams[1] : "-"}`,
+      `P=${fmt(debug.letterP)}`,
+      `K=${fmt(debug.letterK)}`,
+      `Pp=${fmt(debug.letterPPrev)}`,
+      `Kp=${fmt(debug.letterKPrev)}`
+    ].join("\n");
   }
 
   function filterNicksByTeam(set, teamMap, selectedTeam) {
@@ -1213,6 +1517,12 @@
     const displayNameMap = getNickDisplayMap(battleDoc, icons);
 
     const roundState = getCurrentRoundState(allNicks);
+    renderDebugInfo(roundState);
+    if (roundState.pkTeamHints && typeof roundState.pkTeamHints.forEach === "function") {
+      roundState.pkTeamHints.forEach((teamId, nick) => {
+        if (!teamMap.has(nick) && (teamId === 0 || teamId === 1)) teamMap.set(nick, teamId);
+      });
+    }
     const revivedDisabled = new Set();
     roundState.revived.forEach((nick) => {
       const img = nickToImg.get(nick);
@@ -1610,6 +1920,13 @@
     renderWatchBlocks();
   });
 
+  clearCacheBtn.addEventListener("click", () => {
+    try {
+      localStorage.removeItem(ROUND_STATUS_CACHE_KEY);
+    } catch (_e) {}
+    refreshInputStatuses();
+  });
+
   function savePanelOpen(isOpen) {
     localStorage.setItem(PANEL_OPEN_KEY, isOpen ? "1" : "0");
   }
@@ -1744,6 +2061,8 @@
   watchArea.appendChild(blocksHost);
   body.appendChild(watchArea);
   body.appendChild(addRowBtn);
+  body.appendChild(clearCacheBtn);
+  body.appendChild(debugBox);
   panel.appendChild(body);
   root.appendChild(toggle);
   root.appendChild(panel);
