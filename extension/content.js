@@ -716,15 +716,15 @@
 
   function getCurrentRoundContext(doc) {
     const logsNode = doc && doc.getElementById ? doc.getElementById("logs") : null;
-    if (!logsNode) return { lines: [], linesNorm: [], text: "" };
+    if (!logsNode) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
     const text = (logsNode.innerText || logsNode.textContent || "").replace(/\r/g, "");
-    if (!text) return { lines: [], linesNorm: [], text: "" };
+    if (!text) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
 
     let lines = text
       .split("\n")
       .map((line) => String(line || "").replace(/\s+/g, " ").trim())
       .filter(Boolean);
-    if (!lines.length) return { lines: [], linesNorm: [], text: "" };
+    if (!lines.length) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
 
     const getRoundNo = (line) => {
       const raw = String(line || "");
@@ -736,53 +736,32 @@
       return NaN;
     };
 
-    const markers = [];
+    const roundIndexes = [];
     lines.forEach((line, idx) => {
-      const no = getRoundNo(line);
-      if (Number.isFinite(no)) markers.push({ idx, no });
+      if (Number.isFinite(getRoundNo(line))) roundIndexes.push(idx);
     });
 
-    const scoreSegment = (segment) => {
-      if (!segment || !segment.length) return -1;
-      const tokens = [
-        "прокля",
-        "клич",
-        "панцир",
-        "оживить соратника",
-        "вмешался в бой",
-        "заморож",
-        "сошел с ума",
-        "сошла с ума",
-        "сошли с ума",
-        "испугал",
-        "испуган",
-        "иммунитет к боевой магии"
-      ].map(normalizeNick);
-      let score = 0;
-      segment.forEach((line) => {
-        const ln = normalizeNick(line);
-        if (!ln) return;
-        score += 0.1;
-        tokens.forEach((token) => {
-          if (ln.includes(token)) score += 2;
-        });
-      });
-      return score;
-    };
-
-    if (markers.length) {
-      const currentRoundNo = markers.reduce((max, m) => (m.no > max ? m.no : max), -Infinity);
-      const currentMarkers = markers.filter((m) => m.no === currentRoundNo);
-      const markerIdx = currentMarkers.reduce((min, m) => (m.idx < min ? m.idx : min), lines.length);
-      const nextMarkerIdx = markers
-        .filter((m) => m.idx > markerIdx)
-        .reduce((min, m) => (m.idx < min ? m.idx : min), lines.length);
-
-      const candidateTop = lines.slice(0, markerIdx + 1);
-      const candidateDown = lines.slice(markerIdx, nextMarkerIdx);
-      const topScore = scoreSegment(candidateTop);
-      const downScore = scoreSegment(candidateDown);
-      lines = downScore > topScore ? candidateDown : candidateTop;
+    // The battle renderer prepends new records to #logs, so current-round
+    // events are always at the top and the first visible round marker closes
+    // the current block.
+    let previousLines = [];
+    if (roundIndexes.length) {
+      const firstRoundIdx = roundIndexes[0];
+      lines = lines.slice(0, firstRoundIdx + 1);
+      if (roundIndexes.length > 1) {
+        const secondRoundIdx = roundIndexes[1];
+        previousLines = text
+          .split("\n")
+          .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(firstRoundIdx + 1, secondRoundIdx + 1);
+      } else {
+        previousLines = text
+          .split("\n")
+          .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, text.split("\n").length));
+      }
     } else {
       lines = lines.slice(0, Math.min(lines.length, 100));
     }
@@ -790,7 +769,10 @@
     return {
       lines,
       linesNorm: lines.map((line) => normalizeNick(line)),
-      text: lines.join("\n")
+      text: lines.join("\n"),
+      previousLines,
+      previousLinesNorm: previousLines.map((line) => normalizeNick(line)),
+      previousText: previousLines.join("\n")
     };
   }
 
@@ -856,20 +838,22 @@
       ".apeha-helper-map-badge{position:absolute;display:inline-flex;align-items:center;justify-content:center;font:700 10px/10px Tahoma,Verdana,sans-serif;text-shadow:0 0 2px rgba(255,255,255,.7);}" +
       ".apeha-helper-map-badge.shield-blue{left:0;top:0;width:15px;height:15px;clip-path:polygon(50% 100%,10% 62%,10% 8%,90% 8%,90% 62%);border:1px solid #d8f0ff;background:#178dff;box-shadow:0 0 5px #29a7ff;}" +
       ".apeha-helper-map-badge.shield-black{right:0;top:0;width:15px;height:15px;clip-path:polygon(50% 100%,10% 62%,10% 8%,90% 8%,90% 62%);border:1px solid #d0d0d0;background:#111;box-shadow:0 0 5px rgba(0,0,0,.8);}" +
-      ".apeha-helper-map-badge.letter-p,.apeha-helper-map-badge.letter-k{left:1px;right:1px;top:1px;bottom:1px;width:auto;height:auto;font-size:24px;font-weight:900;line-height:1;display:flex;align-items:center;justify-content:center;text-shadow:0 0 2px rgba(255,255,255,.95),1px 0 0 currentColor,-1px 0 0 currentColor,0 1px 0 currentColor,0 -1px 0 currentColor,1px 1px 0 currentColor,-1px -1px 0 currentColor,1px -1px 0 currentColor,-1px 1px 0 currentColor;}" +
+      ".apeha-helper-map-badge.letter-p,.apeha-helper-map-badge.letter-k,.apeha-helper-map-badge.letter-p-prev,.apeha-helper-map-badge.letter-k-prev{left:1px;right:1px;top:1px;bottom:1px;width:auto;height:auto;font-size:24px;font-weight:900;line-height:1;display:flex;align-items:center;justify-content:center;text-shadow:0 0 2px rgba(255,255,255,.95),1px 0 0 currentColor,-1px 0 0 currentColor,0 1px 0 currentColor,0 -1px 0 currentColor,1px 1px 0 currentColor,-1px -1px 0 currentColor,1px -1px 0 currentColor,-1px 1px 0 currentColor;}" +
       ".apeha-helper-map-badge.letter-p{color:#0f5dff;}" +
       ".apeha-helper-map-badge.letter-k{color:#1aaf2c;}" +
+      ".apeha-helper-map-badge.letter-p-prev,.apeha-helper-map-badge.letter-k-prev{color:#111;}" +
       ".apeha-helper-map-badge.mad-face{left:50%;bottom:-2px;transform:translateX(-50%);width:13px;height:13px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#ffe57a,#ffad2f 65%,#ff7a00);border:1px solid #8d3200;box-shadow:0 0 7px rgba(255,155,0,.95);}" +
       ".apeha-helper-map-badge.mad-face::before{content:'';position:absolute;left:2px;top:4px;width:2px;height:2px;border-radius:50%;background:#5f1c00;box-shadow:6px -1px 0 #5f1c00;}" +
       ".apeha-helper-map-badge.mad-face::after{content:'';position:absolute;left:2px;top:8px;width:8px;height:2px;border-radius:2px;background:linear-gradient(90deg,#5f1c00 0 15%,transparent 15% 35%,#5f1c00 35% 55%,transparent 55% 75%,#5f1c00 75% 100%);}" +
-      "#apeha-helper-side-panel{position:absolute;min-width:210px;max-width:280px;background:#f4e5bf;border:1px solid #c9b07f;border-radius:6px;padding:6px;color:#6f1515;font:700 11px/1.3 Tahoma,Verdana,sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.2);z-index:2147483002;}" +
+      "#apeha-helper-side-panel{position:absolute;min-width:210px;max-width:360px;min-height:80px;resize:both;overflow:auto;background:#f4e5bf;border:1px solid #c9b07f;border-radius:6px;padding:6px;color:#6f1515;font:700 11px/1.3 Tahoma,Verdana,sans-serif;box-shadow:0 2px 6px rgba(0,0,0,.2);z-index:2147483002;}" +
       "#apeha-helper-side-panel .section{margin-bottom:4px;}" +
       "#apeha-helper-side-panel .section:last-child{margin-bottom:0;}" +
       "#apeha-helper-side-panel .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;cursor:move;user-select:none;}" +
       "#apeha-helper-side-panel .close{border:1px solid #bda572;background:linear-gradient(#efe2be,#dcc595);color:#8f1414;border-radius:3px;width:16px;height:16px;line-height:14px;padding:0;cursor:pointer;}" +
       "#apeha-helper-side-panel .k{color:#7f0d0d;}" +
       "#apeha-helper-side-panel .v{font-weight:700;color:#2f1c00;}" +
-      "#apeha-helper-side-panel .nick{color:#183d8f;text-decoration:underline;cursor:pointer;}";
+      "#apeha-helper-side-panel .nick{color:#183d8f;text-decoration:underline;cursor:pointer;}" +
+      "#apeha-helper-side-panel .nick.old{color:#111;}";
     (doc.head || doc.documentElement).appendChild(style);
   }
 
@@ -893,26 +877,29 @@
     const blackShieldCurrent = new Set();
     const letterP = new Set();
     const letterK = new Set();
+    const letterPPrev = new Set();
+    const letterKPrev = new Set();
     const mad = new Set();
     const frozen = new Set();
     const feared = new Set();
     const revived = new Set();
 
     if (!allNicks || !allNicks.size) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
     }
 
     const battleDoc = resolveBattleDocument();
     if (!battleDoc) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
     }
 
     syncBattleScope(battleDoc);
     const round = getCurrentRoundContext(battleDoc);
     const lines = round.linesNorm;
     if (!lines.length) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
     }
+    const previousLines = round.previousLinesNorm || [];
 
     const nicks = Array.from(allNicks).filter((nick) => !isInvisibleNick(nick));
     const blueTokens = [
@@ -976,12 +963,28 @@
       findActorsInLine(lineNorm, interveneToken, nicks).forEach((nick) => revived.add(nick));
     });
 
+    previousLines.forEach((lineNorm) => {
+      if (!lineNorm) return;
+      if (lineNorm.includes(pToken)) {
+        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => {
+          if (!letterP.has(nick)) letterPPrev.add(nick);
+        });
+      }
+      if (lineNorm.includes(kToken)) {
+        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => {
+          if (!letterK.has(nick)) letterKPrev.add(nick);
+        });
+      }
+    });
+
     blackShieldCurrent.forEach((nick) => stickyBlackShield.add(nick));
     return {
       blueShield,
       blackShield: new Set(stickyBlackShield),
       letterP,
       letterK,
+      letterPPrev,
+      letterKPrev,
       mad,
       frozen,
       feared,
@@ -1050,27 +1053,32 @@
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
 
-    const toList = (set) => {
-      const items = Array.from(filterNicksByTeam(set, teamMap, selectedTeam));
+    const toList = (currentSet, previousSet) => {
+      const currentItems = Array.from(filterNicksByTeam(currentSet, teamMap, selectedTeam)).map((nickKey) => ({ nickKey, old: false }));
+      const previousItems = Array.from(filterNicksByTeam(previousSet, teamMap, selectedTeam))
+        .filter((nickKey) => !currentSet.has(nickKey))
+        .map((nickKey) => ({ nickKey, old: true }));
+      const items = currentItems.concat(previousItems);
       if (!items.length) return "-";
       return items
-        .map((nickKey) => {
+        .map(({ nickKey, old }) => {
           const nickDisplay = (displayNameMap && displayNameMap.get(nickKey)) || nickKey;
           const safe = escapeHtml(nickDisplay);
           const href = `/info.html?nick=${encodeURIComponent(nickDisplay)}`;
-          return `<a class="nick" data-nick="${safe}" href="${href}" target="_blank" rel="noopener noreferrer">${safe}</a>`;
+          const cls = old ? "nick old" : "nick";
+          return `<a class="${cls}" data-nick="${safe}" href="${href}" target="_blank" rel="noopener noreferrer">${safe}</a>`;
         })
         .join(", ");
     };
 
     const sections = [
-      ["прокля", toList(roundState.letterP)],
-      ["клич", toList(roundState.letterK)],
-      ["сведен с ума", toList(roundState.mad)],
-      ["заморожен", toList(roundState.frozen)],
-      ["неуязвим", toList(roundState.blueShield)],
-      ["иммунитет", toList(roundState.blackShield)],
-      ["поднят в прокле", toList(revivedDisabled)]
+      ["прокля", toList(roundState.letterP, roundState.letterPPrev)],
+      ["клич", toList(roundState.letterK, roundState.letterKPrev)],
+      ["сведен с ума", toList(roundState.mad, new Set())],
+      ["заморожен", toList(roundState.frozen, new Set())],
+      ["неуязвим", toList(roundState.blueShield, new Set())],
+      ["иммунитет", toList(roundState.blackShield, new Set())],
+      ["поднят в прокле", toList(revivedDisabled, new Set())]
     ];
 
     panelNode.innerHTML = [
@@ -1146,11 +1154,13 @@
   function renderIconBadges(doc, img, badgeSets, nick) {
     if (!nick || isInvisibleNick(nick)) return;
     const badges = [];
-    if (badgeSets.blackShield.has(nick)) badges.push({ cls: "shield-black" });
-    if (badgeSets.blueShield.has(nick)) badges.push({ cls: "shield-blue" });
-    if (badgeSets.letterP.has(nick)) badges.push({ cls: "letter-p", text: "П" });
-    if (badgeSets.letterK.has(nick)) badges.push({ cls: "letter-k", text: "К" });
-    if (badgeSets.mad.has(nick)) badges.push({ cls: "mad-face" });
+    if (badgeSets.blackShield.has(nick)) badges.push({ cls: "shield-black", title: "Иммунитет к боевой магии" });
+    if (badgeSets.blueShield.has(nick)) badges.push({ cls: "shield-blue", title: "Неуязвимость" });
+    if (badgeSets.letterP.has(nick)) badges.push({ cls: "letter-p", text: "П", title: "Проклясть противника: текущий раунд" });
+    if (badgeSets.letterK.has(nick)) badges.push({ cls: "letter-k", text: "К", title: "Боевой клич: текущий раунд" });
+    if (badgeSets.letterPPrev.has(nick)) badges.push({ cls: "letter-p-prev", text: "П", title: "Проклясть противника: прошлый раунд" });
+    if (badgeSets.letterKPrev.has(nick)) badges.push({ cls: "letter-k-prev", text: "К", title: "Боевой клич: прошлый раунд" });
+    if (badgeSets.mad.has(nick)) badges.push({ cls: "mad-face", title: "Сведен с ума" });
     if (!badges.length) return;
 
     const host = doc.createElement("span");
@@ -1164,6 +1174,7 @@
       const node = doc.createElement("span");
       node.className = `apeha-helper-map-badge ${b.cls}`;
       if (b.text) node.textContent = b.text;
+      if (b.title) node.title = b.title;
       host.appendChild(node);
     });
 
@@ -1222,6 +1233,8 @@
       blueShield: filterNicksByTeam(roundState.blueShield, teamMap, selectedTeam),
       letterP: filterNicksByTeam(roundState.letterP, teamMap, selectedTeam),
       letterK: filterNicksByTeam(roundState.letterK, teamMap, selectedTeam),
+      letterPPrev: filterNicksByTeam(roundState.letterPPrev, teamMap, selectedTeam),
+      letterKPrev: filterNicksByTeam(roundState.letterKPrev, teamMap, selectedTeam),
       mad: filterNicksByTeam(roundState.mad, teamMap, selectedTeam)
     };
 
