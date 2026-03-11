@@ -9,10 +9,15 @@
   const GAME_FEATURES_KEY = "apehaHelperGameFeaturesV1";
   const LAST_JOIN_REQUEST_KEY = "apehaHelperLastJoinRequestV1";
   const BATTLE_WATCH_KEY = "apehaHelperBattleWatchV1";
+  const IMMUNITY_WATCH_KEY = "apehaHelperImmunityWatchV1";
   const LAST_ACTIVITY_KEY = "apehaHelperLastUserActivityV1";
   const IDLE_THRESHOLD_MS = 60 * 1000;
   const REFRESH_DELAY_MIN_MS = 4000;
   const REFRESH_DELAY_RANGE_MS = 4500;
+  const IMMUNITY_INITIAL_DELAY_MS = 10 * 60 * 1000;
+  const IMMUNITY_REFRESH_MIN_MS = 10 * 60 * 1000;
+  const IMMUNITY_REFRESH_RANGE_MS = 5 * 60 * 1000;
+  const IMMUNITY_ALERT_THRESHOLD_MS = 15 * 60 * 1000;
   const ACTIVITY_EVENTS = ["mousemove", "mousedown", "click", "keydown", "wheel", "touchstart"];
   let activityThrottleTs = 0;
 
@@ -127,7 +132,6 @@
       return true;
     }
   })();
-  if (!hasBattleContext) return;
   if (window.__apehaHelperLoaded) return;
   window.__apehaHelperLoaded = true;
 
@@ -216,6 +220,11 @@
   let sidePanelPos = null;
   let activeSection = loadMainTab();
   let gameFeatures = loadGameFeatures();
+  let immunityWatch = loadImmunityWatch();
+  let immunityRefreshTimeoutId = 0;
+  let immunityTickIntervalId = 0;
+  let immunityLinkRetryTimeoutId = 0;
+  let immunityLinkRetryCount = 0;
   const rosterCtrlClickBoundDocs = new WeakSet();
   const mapCtrlClickBoundDocs = new WeakSet();
   const joinTrackingBoundDocs = new WeakSet();
@@ -241,7 +250,8 @@
     const value = raw && typeof raw === "object" ? raw : {};
     return {
       requestHighlight: value.requestHighlight !== false,
-      soundEnabled: value.soundEnabled !== false
+      soundEnabled: value.soundEnabled !== false,
+      immunityWatchEnabled: value.immunityWatchEnabled === true
     };
   }
 
@@ -255,6 +265,369 @@
 
   function saveGameFeatures() {
     localStorage.setItem(GAME_FEATURES_KEY, JSON.stringify(gameFeatures));
+  }
+
+  function normalizeImmunityWatch(raw) {
+    const value = raw && typeof raw === "object" ? raw : {};
+    return {
+      userId: String(value.userId || "").trim(),
+      sourceUrl: String(value.sourceUrl || "").trim(),
+      lastCheckedAt: Number(value.lastCheckedAt) || 0,
+      immuneUntilTs: Number(value.immuneUntilTs) || 0,
+      lastSeenText: String(value.lastSeenText || "").trim(),
+      alertedAtThreshold: value.alertedAtThreshold === true,
+      notificationDismissed: value.notificationDismissed === true,
+      requestInFlight: value.requestInFlight === true,
+      fetchError: String(value.fetchError || "").trim()
+    };
+  }
+
+  function loadImmunityWatch() {
+    return normalizeImmunityWatch(readJson(IMMUNITY_WATCH_KEY, null));
+  }
+
+  function saveImmunityWatch() {
+    localStorage.setItem(IMMUNITY_WATCH_KEY, JSON.stringify(immunityWatch));
+  }
+
+  function updateImmunityWatch(patch) {
+    immunityWatch = normalizeImmunityWatch(Object.assign({}, immunityWatch, patch || {}));
+    saveImmunityWatch();
+    renderGameMenu();
+    syncImmunityAlertUi();
+    return immunityWatch;
+  }
+
+  function clearImmunityWatchRequestFlag() {
+    if (!immunityWatch.requestInFlight) return;
+    updateImmunityWatch({ requestInFlight: false });
+  }
+
+  function playImmunityEndingSignal() {
+    if (!gameFeatures.soundEnabled) return;
+    const ctx = ensureSharedAudioContext();
+    if (!ctx) return;
+    try {
+      if (ctx.state === "suspended" && typeof ctx.resume === "function") ctx.resume().catch(() => {});
+      const now = typeof ctx.currentTime === "number" ? ctx.currentTime : 0;
+      [
+        [0, 990, 0.09, "triangle", 0.045],
+        [0.12, 880, 0.09, "triangle", 0.045],
+        [0.24, 990, 0.16, "triangle", 0.05]
+      ].forEach((step) => {
+        const [offset, freq, duration, type, volume] = step;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const startAt = now + offset;
+        const stopAt = startAt + duration;
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, startAt);
+        gain.gain.setValueAtTime(0.0001, startAt);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), startAt + Math.min(0.025, duration / 3));
+        gain.gain.exponentialRampToValueAtTime(0.0001, stopAt);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(startAt);
+        osc.stop(stopAt + 0.01);
+      });
+    } catch (_e) {}
+  }
+
+  function clearImmunityRefreshTimer() {
+    if (!immunityRefreshTimeoutId) return;
+    window.clearTimeout(immunityRefreshTimeoutId);
+    immunityRefreshTimeoutId = 0;
+  }
+
+  function clearImmunityLinkRetryTimer() {
+    if (!immunityLinkRetryTimeoutId) return;
+    window.clearTimeout(immunityLinkRetryTimeoutId);
+    immunityLinkRetryTimeoutId = 0;
+  }
+
+  function ensureImmunityTickLoop() {
+    if (immunityTickIntervalId) return;
+    immunityTickIntervalId = window.setInterval(() => {
+      if (helperDisabled) return;
+      syncImmunityAlertUi();
+      if (activeSection === "game" || immunityWatch.requestInFlight || immunityWatch.immuneUntilTs > 0) {
+        renderGameMenu();
+      }
+    }, 1000);
+  }
+
+  function readImmunityInfoLink() {
+    try {
+      const topWindow = window.top || window;
+      const dPers = topWindow.frames && topWindow.frames.d_pers;
+      const doc = dPers && dPers.document;
+      const infoLink = doc && doc.getElementById && doc.getElementById("IMG_info");
+      const href = String((infoLink && infoLink.getAttribute && infoLink.getAttribute("href")) || (infoLink && infoLink.href) || "").trim();
+      if (!href) return null;
+      const fullUrl = new URL(href, window.location.origin);
+      const userId = String(fullUrl.searchParams.get("user") || "").trim();
+      if (!userId) return null;
+      return {
+        userId,
+        sourceUrl: `${fullUrl.pathname}${fullUrl.search}`
+      };
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function syncImmunityIdentity() {
+    const identity = readImmunityInfoLink();
+    if (!identity) return false;
+    if (identity.userId === immunityWatch.userId && identity.sourceUrl === immunityWatch.sourceUrl) return true;
+    updateImmunityWatch({
+      userId: identity.userId,
+      sourceUrl: identity.sourceUrl,
+      fetchError: ""
+    });
+    return true;
+  }
+
+  function scheduleImmunityIdentityRetry() {
+    clearImmunityLinkRetryTimer();
+    if (!gameFeatures.immunityWatchEnabled || immunityWatch.userId) return;
+    if (immunityLinkRetryCount >= 20) return;
+    immunityLinkRetryCount += 1;
+    immunityLinkRetryTimeoutId = window.setTimeout(() => {
+      immunityLinkRetryTimeoutId = 0;
+      if (syncImmunityIdentity()) {
+        immunityLinkRetryCount = 0;
+        if (!immunityWatch.lastCheckedAt) scheduleNextImmunityCheck(IMMUNITY_INITIAL_DELAY_MS);
+        return;
+      }
+      scheduleImmunityIdentityRetry();
+    }, 1500);
+  }
+
+  function formatImmunityDuration(ms) {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}ч ${minutes}мин`;
+    if (minutes > 0) return `${minutes}мин ${seconds}с`;
+    return `${seconds}с`;
+  }
+
+  function getImmunityRemainingMs() {
+    return immunityWatch.immuneUntilTs > 0 ? immunityWatch.immuneUntilTs - Date.now() : 0;
+  }
+
+  function parseImmunityTimer(text) {
+    const source = String(text || "");
+    const hoursMatch = source.match(/(\d+)\s*ч/i);
+    const minutesMatch = source.match(/(\d+)\s*мин/i);
+    const secondsMatch = source.match(/(\d+)\s*с/i);
+    const hours = hoursMatch ? Number(hoursMatch[1]) : 0;
+    const minutes = minutesMatch ? Number(minutesMatch[1]) : 0;
+    const seconds = secondsMatch ? Number(secondsMatch[1]) : 0;
+    const totalMs = (((hours * 60) + minutes) * 60 + seconds) * 1000;
+    return totalMs > 0 ? totalMs : 0;
+  }
+
+  function decodeResponseText(buffer, contentType, fallbackText) {
+    const header = String(contentType || "");
+    const charsetMatch = header.match(/charset\s*=\s*["']?([a-z0-9_-]+)/i);
+    const charset = String((charsetMatch && charsetMatch[1]) || "").trim().toLowerCase();
+    const candidates = [];
+    if (charset) candidates.push(charset);
+    if (!candidates.includes("windows-1251")) candidates.push("windows-1251");
+    if (!candidates.includes("utf-8")) candidates.push("utf-8");
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        return new TextDecoder(candidates[i]).decode(buffer);
+      } catch (_e) {}
+    }
+    return String(fallbackText || "");
+  }
+
+  function extractImmunityInfoFromHtml(htmlText) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(String(htmlText || ""), "text/html");
+    const text = String((doc.body && (doc.body.textContent || doc.body.innerText)) || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!/Иммунитет\s+к\s+нападениям/i.test(text)) {
+      return { found: false, remainingMs: 0, displayText: "" };
+    }
+    const idx = text.search(/Иммунитет\s+к\s+нападениям/i);
+    const fragment = idx >= 0 ? text.slice(idx, idx + 240) : text;
+    const remainMatch = fragment.match(/осталось\s*:\s*((?:\d+\s*ч\s*)?(?:\d+\s*мин\s*)?(?:\d+\s*с\s*)?)/i);
+    const displayText = String((remainMatch && remainMatch[1]) || "").trim();
+    const remainingMs = parseImmunityTimer(displayText || fragment);
+    return {
+      found: true,
+      remainingMs,
+      displayText
+    };
+  }
+
+  function getImmunityStatusText() {
+    if (immunityWatch.requestInFlight) return "Проверка...";
+    if (!gameFeatures.immunityWatchEnabled) return "Выключено";
+    if (immunityWatch.fetchError) return immunityWatch.fetchError;
+    if (!immunityWatch.userId) return "Не удалось определить игрока";
+    if (immunityWatch.immuneUntilTs > Date.now()) return `Осталось: ${formatImmunityDuration(getImmunityRemainingMs())}`;
+    if (immunityWatch.lastCheckedAt > 0) return "Иммунитет не обнаружен";
+    return "Нет данных";
+  }
+
+  function scheduleNextImmunityCheck(delayMs) {
+    clearImmunityRefreshTimer();
+    if (!gameFeatures.immunityWatchEnabled) return;
+    const delay = Math.max(1000, Number(delayMs) || 0);
+    immunityRefreshTimeoutId = window.setTimeout(() => {
+      immunityRefreshTimeoutId = 0;
+      runImmunityCheck(false);
+    }, delay);
+  }
+
+  function scheduleRandomImmunityCheck() {
+    const delayMs = IMMUNITY_REFRESH_MIN_MS + Math.floor(Math.random() * IMMUNITY_REFRESH_RANGE_MS);
+    scheduleNextImmunityCheck(delayMs);
+  }
+
+  async function runImmunityCheck(forceNow) {
+    if (!gameFeatures.immunityWatchEnabled) return;
+    if (immunityWatch.requestInFlight) return;
+    if (!syncImmunityIdentity() && !immunityWatch.userId) {
+      updateImmunityWatch({
+        lastCheckedAt: forceNow ? Date.now() : immunityWatch.lastCheckedAt,
+        fetchError: "Не удалось определить игрока"
+      });
+      scheduleImmunityIdentityRetry();
+      if (forceNow) scheduleRandomImmunityCheck();
+      return;
+    }
+    const sourceUrl = immunityWatch.sourceUrl || `/info.html?user=${encodeURIComponent(immunityWatch.userId)}`;
+    updateImmunityWatch({
+      requestInFlight: true,
+      fetchError: ""
+    });
+    try {
+      const response = await fetch(sourceUrl, {
+        credentials: "include"
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const buffer = await response.arrayBuffer();
+      const htmlText = decodeResponseText(buffer, response.headers && response.headers.get ? response.headers.get("content-type") : "", "");
+      const parsed = extractImmunityInfoFromHtml(htmlText);
+      const now = Date.now();
+      if (!parsed.found || parsed.remainingMs <= 0) {
+        updateImmunityWatch({
+          lastCheckedAt: now,
+          immuneUntilTs: 0,
+          lastSeenText: "",
+          alertedAtThreshold: false,
+          notificationDismissed: false,
+          requestInFlight: false,
+          fetchError: ""
+        });
+      } else {
+        updateImmunityWatch({
+          lastCheckedAt: now,
+          immuneUntilTs: now + parsed.remainingMs,
+          lastSeenText: parsed.displayText,
+          requestInFlight: false,
+          fetchError: "",
+          notificationDismissed: false
+        });
+      }
+    } catch (_e) {
+      updateImmunityWatch({
+        lastCheckedAt: Date.now(),
+        requestInFlight: false,
+        fetchError: "Ошибка проверки"
+      });
+    }
+    scheduleRandomImmunityCheck();
+  }
+
+  function syncImmunityAlertUi() {
+    let box = root.querySelector("#apeha-helper-immunity-alert");
+    const remainingMs = getImmunityRemainingMs();
+    const shouldShow = !!(
+      gameFeatures.immunityWatchEnabled &&
+      immunityWatch.immuneUntilTs > Date.now() &&
+      remainingMs > 0 &&
+      remainingMs < IMMUNITY_ALERT_THRESHOLD_MS &&
+      !immunityWatch.notificationDismissed
+    );
+
+    if (remainingMs <= 0 && (immunityWatch.immuneUntilTs || immunityWatch.alertedAtThreshold || immunityWatch.notificationDismissed)) {
+      updateImmunityWatch({
+        immuneUntilTs: 0,
+        lastSeenText: "",
+        alertedAtThreshold: false,
+        notificationDismissed: false,
+        fetchError: immunityWatch.fetchError
+      });
+      return;
+    }
+
+    if (shouldShow && !immunityWatch.alertedAtThreshold) {
+      playImmunityEndingSignal();
+      updateImmunityWatch({
+        alertedAtThreshold: true
+      });
+      return;
+    }
+
+    if (!shouldShow) {
+      if (box) box.remove();
+      return;
+    }
+
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "apeha-helper-immunity-alert";
+
+      const text = document.createElement("span");
+      text.className = "apeha-helper-immunity-alert-text";
+      box.appendChild(text);
+
+      const closeBtn = document.createElement("button");
+      closeBtn.type = "button";
+      closeBtn.className = "apeha-helper-immunity-alert-close";
+      closeBtn.title = "Закрыть";
+      closeBtn.textContent = "x";
+      closeBtn.addEventListener("click", () => {
+        updateImmunityWatch({
+          notificationDismissed: true
+        });
+      });
+      box.appendChild(closeBtn);
+      root.appendChild(box);
+    }
+
+    const textEl = box.querySelector(".apeha-helper-immunity-alert-text");
+    if (textEl) textEl.textContent = `Заканчивается иммунитет: ${formatImmunityDuration(remainingMs)}`;
+  }
+
+  function updateImmunityMonitoring() {
+    clearImmunityRefreshTimer();
+    clearImmunityLinkRetryTimer();
+    if (!gameFeatures.immunityWatchEnabled) {
+      clearImmunityWatchRequestFlag();
+      syncImmunityAlertUi();
+      return;
+    }
+    ensureImmunityTickLoop();
+    if (syncImmunityIdentity()) immunityLinkRetryCount = 0;
+    else scheduleImmunityIdentityRetry();
+    if (!immunityWatch.lastCheckedAt) {
+      scheduleNextImmunityCheck(IMMUNITY_INITIAL_DELAY_MS);
+      return;
+    }
+    const nextDueAt = immunityWatch.lastCheckedAt + IMMUNITY_REFRESH_MIN_MS;
+    const delay = Math.max(1000, nextDueAt - Date.now());
+    scheduleNextImmunityCheck(delay);
   }
 
   function readJson(key, fallback) {
@@ -1566,10 +1939,6 @@
       "background-color:rgba(255,255,0,0.78)!important;" +
       "box-shadow:0 0 0 5px #ffff00,0 0 22px 7px rgba(255,255,0,1)!important;" +
       "border-radius:50%!important;}" +
-      ".apeha-helper-map-target-revive{" +
-      "background-color:rgba(255,64,64,0.72)!important;" +
-      "box-shadow:0 0 0 5px #ff2a2a,0 0 22px 7px rgba(255,36,36,1)!important;" +
-      "border-radius:50%!important;}" +
       ".apeha-helper-map-badges{position:absolute;pointer-events:none;z-index:2147483001;overflow:visible;}" +
       ".apeha-helper-map-badge{position:absolute;display:inline-flex;align-items:center;justify-content:center;font:700 10px/10px Tahoma,Verdana,sans-serif;text-shadow:0 0 2px rgba(255,255,255,.7);}" +
       ".apeha-helper-map-badge.shield-blue{left:0;top:0;width:15px;height:15px;clip-path:polygon(50% 100%,10% 62%,10% 8%,90% 8%,90% 62%);border:1px solid #d8f0ff;background:#178dff;box-shadow:0 0 5px #29a7ff;}" +
@@ -1618,22 +1987,21 @@
     const mad = new Set();
     const frozen = new Set();
     const feared = new Set();
-    const revived = new Set();
 
     if (!allNicks || !allNicks.size) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared };
     }
 
     const battleDoc = resolveBattleDocument();
     if (!battleDoc) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared };
     }
 
     syncBattleScope(battleDoc);
     const round = getCurrentRoundContext(battleDoc);
     const lines = round.linesNorm;
     if (!lines.length) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared };
     }
     const previousLines = round.previousLinesNorm || [];
 
@@ -1652,9 +2020,6 @@
     const blackToken = normalizeNick("иммунитет к боевой магии");
     const pToken = normalizeNick("проклясть противника");
     const kToken = normalizeNick("боевой клич");
-    const reviveToken = normalizeNick("оживить соратника");
-    const useScrollToken = normalizeNick("использовал свиток");
-    const interveneToken = normalizeNick("вмешался в бой");
     const madnessTokens = [
       normalizeNick("сошел с ума"),
       normalizeNick("сошла с ума"),
@@ -1693,10 +2058,6 @@
         });
       }
 
-      if (!lineNorm.includes(interveneToken) || idx + 1 >= lines.length) return;
-      const nextLine = lines[idx + 1];
-      if (!nextLine.includes(useScrollToken) || !nextLine.includes(reviveToken)) return;
-      findActorsInLine(lineNorm, interveneToken, nicks).forEach((nick) => revived.add(nick));
     });
 
     previousLines.forEach((lineNorm) => {
@@ -1723,8 +2084,7 @@
       letterKPrev,
       mad,
       frozen,
-      feared,
-      revived
+      feared
     };
   }
 
@@ -1903,7 +2263,7 @@
     return out;
   }
 
-  function renderBattleSidePanel(doc, selectedTeam, teamMap, roundState, revivedDisabled, displayNameMap) {
+  function renderBattleSidePanel(doc, selectedTeam, teamMap, roundState, displayNameMap) {
     const mapImg = doc.getElementById("map");
     if (!mapImg) return;
     const layerHost = doc.body || doc.documentElement;
@@ -1974,9 +2334,9 @@
       ["клич", toList(roundState.letterK, roundState.letterKPrev)],
       ["сведен с ума", toList(roundState.mad, new Set())],
       ["заморожен", toList(roundState.frozen, new Set())],
+      ["испугался", toList(roundState.feared, new Set())],
       ["неуязвим", toList(roundState.blueShield, new Set())],
-      ["иммунитет", toList(roundState.blackShield, new Set())],
-      ["поднят в прокле", toList(revivedDisabled, new Set())]
+      ["иммунитет", toList(roundState.blackShield, new Set())]
     ];
 
     panelNode.innerHTML = [
@@ -2041,7 +2401,7 @@
     if (!doc) return;
     doc.querySelectorAll(".apeha-helper-map-badges").forEach((el) => el.remove());
     doc.querySelectorAll('img[id^="pr_"]').forEach((img) => {
-      img.classList.remove("apeha-helper-map-target", "apeha-helper-map-target-revive");
+      img.classList.remove("apeha-helper-map-target");
     });
     const side = doc.getElementById("apeha-helper-side-panel");
     if (side) side.remove();
@@ -2119,15 +2479,6 @@
 
     const baseRoundState = getCurrentRoundState(allNicks);
     const roundState = applyPkCarryover(baseRoundState, battleDoc, allNicks, teamMap);
-    const revivedDisabled = new Set();
-    roundState.revived.forEach((nick) => {
-      const img = nickToImg.get(nick);
-      if (!img) return;
-      const src = String(img.getAttribute("src") || "").toLowerCase();
-      if (/(^|\/)pb[01]d\.(png|gif)(\?|$)/.test(src) || /pb[01]d\.(png|gif)/.test(src)) {
-        revivedDisabled.add(nick);
-      }
-    });
 
     const teamVisibleNicks = new Set();
     allNicks.forEach((nick) => {
@@ -2147,13 +2498,11 @@
     icons.forEach((img) => {
       const nick = extractNickFromMapTitle(img.getAttribute("title") || "");
       const marked = nick && !isInvisibleNick(nick) && tracked.has(nick);
-      const isRevivedDisabled = nick && revivedDisabled.has(nick) && teamVisibleNicks.has(nick);
       img.classList.toggle("apeha-helper-map-target", !!marked);
-      img.classList.toggle("apeha-helper-map-target-revive", !!isRevivedDisabled);
       if (nick && teamVisibleNicks.has(nick)) renderIconBadges(battleDoc, img, displayBadgeSets, nick);
     });
 
-    renderBattleSidePanel(battleDoc, selectedTeam, teamMap, roundState, revivedDisabled, displayNameMap);
+    renderBattleSidePanel(battleDoc, selectedTeam, teamMap, roundState, displayNameMap);
   }
 
   function getRoundEffects(trackedNicks) {
@@ -2412,6 +2761,67 @@
     item.appendChild(topRow);
     item.appendChild(desc);
     gameFeatureList.appendChild(item);
+
+    const immunityItem = document.createElement("div");
+    immunityItem.className = "apeha-helper-game-item";
+
+    const immunityTopRow = document.createElement("div");
+    immunityTopRow.className = "apeha-helper-game-item-row";
+
+    const immunityToggle = document.createElement("label");
+    immunityToggle.className = "apeha-helper-game-item-toggle";
+
+    const immunityBox = document.createElement("input");
+    immunityBox.type = "checkbox";
+    immunityBox.checked = !!gameFeatures.immunityWatchEnabled;
+    immunityBox.addEventListener("change", () => {
+      gameFeatures.immunityWatchEnabled = !!immunityBox.checked;
+      saveGameFeatures();
+      if (!gameFeatures.immunityWatchEnabled) {
+        clearImmunityRefreshTimer();
+        clearImmunityLinkRetryTimer();
+        updateImmunityWatch({
+          requestInFlight: false,
+          alertedAtThreshold: false,
+          notificationDismissed: false,
+          fetchError: ""
+        });
+      }
+      updateImmunityMonitoring();
+      renderGameMenu();
+    });
+
+    const immunityTitle = document.createElement("span");
+    immunityTitle.className = "apeha-helper-game-item-title";
+    immunityTitle.textContent = "Следить за иммунитетом";
+
+    immunityToggle.appendChild(immunityBox);
+    immunityToggle.appendChild(immunityTitle);
+    immunityTopRow.appendChild(immunityToggle);
+
+    const immunityActions = document.createElement("div");
+    immunityActions.className = "apeha-helper-game-item-actions";
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.type = "button";
+    refreshBtn.className = "apeha-helper-game-icon-btn";
+    refreshBtn.title = immunityWatch.requestInFlight ? "Проверка..." : "Проверить иммунитет сейчас";
+    refreshBtn.textContent = "↻";
+    refreshBtn.disabled = !gameFeatures.immunityWatchEnabled || !!immunityWatch.requestInFlight;
+    refreshBtn.addEventListener("click", () => {
+      runImmunityCheck(true);
+    });
+    immunityActions.appendChild(refreshBtn);
+
+    immunityTopRow.appendChild(immunityActions);
+
+    const immunityDesc = document.createElement("div");
+    immunityDesc.className = "apeha-helper-game-item-desc";
+    immunityDesc.textContent = getImmunityStatusText();
+
+    immunityItem.appendChild(immunityTopRow);
+    immunityItem.appendChild(immunityDesc);
+    gameFeatureList.appendChild(immunityItem);
   }
 
   function applySectionState() {
@@ -2432,7 +2842,7 @@
     saveMainTab();
     applySectionState();
     normalizeHelperWidth();
-    if (!helperDisabled && isBattleSectionOpen()) refreshInputStatuses();
+    if (!helperDisabled && hasBattleContext && isBattleSectionOpen()) refreshInputStatuses();
   }
 
   function renderWatchBlocks() {
@@ -2597,7 +3007,7 @@
     });
 
     focusBlock(activeBlockIndex);
-    refreshInputStatuses();
+    if (hasBattleContext) refreshInputStatuses();
     normalizeHelperWidth();
   }
 
@@ -2788,8 +3198,14 @@
   renderGameMenu();
   renderWatchBlocks();
   applySectionState();
+  updateImmunityMonitoring();
+  syncImmunityAlertUi();
   refreshTimerId = window.setInterval(() => {
-    if (!helperDisabled) refreshInputStatuses();
+    if (!helperDisabled && hasBattleContext) refreshInputStatuses();
+    if (!helperDisabled && (activeSection === "game" || immunityWatch.requestInFlight || immunityWatch.immuneUntilTs > 0)) {
+      syncImmunityAlertUi();
+      renderGameMenu();
+    }
   }, 1000);
   if (helperDisabled) applyHiddenState(true);
 })();

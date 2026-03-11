@@ -181,11 +181,71 @@
   white-space: nowrap;
 }
 
+.apeha-helper-game-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.apeha-helper-game-icon-btn {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid #b58e45;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #fbf2dd 0%, #dfc38b 100%);
+  color: #7f0d0d;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.apeha-helper-game-icon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .apeha-helper-game-item-subtitle {
   font-size: 9px;
   font-weight: 700;
   color: #8f1414;
   line-height: 1;
+}
+
+#apeha-helper-immunity-alert {
+  position: absolute;
+  right: calc(100% + 8px);
+  top: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 190px;
+  padding: 7px 9px;
+  border: 1px solid rgba(193, 84, 132, 0.65);
+  border-radius: 8px;
+  background: rgba(255, 174, 208, 0.82);
+  box-shadow: 0 4px 10px rgba(103, 30, 64, 0.18);
+  color: #7a123f;
+  font: 700 10px/1.2 Arial, Verdana, sans-serif;
+}
+
+.apeha-helper-immunity-alert-text {
+  flex: 1 1 auto;
+}
+
+.apeha-helper-immunity-alert-close {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.55);
+  color: #7a123f;
+  font: 700 10px/1 Arial, Verdana, sans-serif;
+  cursor: pointer;
 }
 
 
