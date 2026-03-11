@@ -3,9 +3,71 @@
   const isTopWindow = window === window.top;
   const isActionFrame = frameName === "d_act";
   const isMenuFrame = frameName === "d_menu";
-  if (!isTopWindow && !isActionFrame && !isMenuFrame) return;
   const TOGGLE_HIDDEN_KEY = "apehaHelperToggleHiddenV1";
   const ROUND_STATUS_CACHE_KEY = "apehaHelperRoundStatusCacheV1";
+  const MAIN_TAB_KEY = "apehaHelperMainTabV1";
+  const GAME_FEATURES_KEY = "apehaHelperGameFeaturesV1";
+  const LAST_JOIN_REQUEST_KEY = "apehaHelperLastJoinRequestV1";
+  const BATTLE_WATCH_KEY = "apehaHelperBattleWatchV1";
+  const LAST_ACTIVITY_KEY = "apehaHelperLastUserActivityV1";
+  const IDLE_THRESHOLD_MS = 60 * 1000;
+  const REFRESH_DELAY_MIN_MS = 4000;
+  const REFRESH_DELAY_RANGE_MS = 4500;
+  const ACTIVITY_EVENTS = ["mousemove", "mousedown", "click", "keydown", "wheel", "touchstart"];
+  let activityThrottleTs = 0;
+
+  function getSharedTopWindow() {
+    try {
+      return window.top || window;
+    } catch (_e) {
+      return window;
+    }
+  }
+
+  function ensureSharedAudioContext() {
+    const sharedWindow = getSharedTopWindow();
+    if (sharedWindow.__apehaHelperAudioContext) return sharedWindow.__apehaHelperAudioContext;
+    const AudioCtor =
+      window.AudioContext ||
+      window.webkitAudioContext ||
+      sharedWindow.AudioContext ||
+      sharedWindow.webkitAudioContext;
+    if (!AudioCtor) return null;
+    try {
+      const ctx = new AudioCtor();
+      sharedWindow.__apehaHelperAudioContext = ctx;
+      return ctx;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function primeSharedAudioContext() {
+    const ctx = ensureSharedAudioContext();
+    if (!ctx || ctx.state !== "suspended" || typeof ctx.resume !== "function") return;
+    try {
+      ctx.resume().catch(() => {});
+    } catch (_e) {}
+  }
+
+  function markUserActivity() {
+    const now = Date.now();
+    if (now - activityThrottleTs >= 250) {
+      activityThrottleTs = now;
+      try {
+        localStorage.setItem(LAST_ACTIVITY_KEY, String(now));
+      } catch (_e) {}
+    }
+    primeSharedAudioContext();
+  }
+
+  ACTIVITY_EVENTS.forEach((eventName) => {
+    try {
+      document.addEventListener(eventName, markUserActivity, true);
+    } catch (_e) {}
+  });
+
+  if (!isTopWindow && !isActionFrame && !isMenuFrame) return;
   if (isMenuFrame) {
     if (window.__apehaHelperClockHookLoaded) return;
     window.__apehaHelperClockHookLoaded = true;
@@ -41,6 +103,7 @@
   const hasBattleContext = (() => {
     try {
       const href = (window.location && window.location.href ? window.location.href : "").toLowerCase();
+      const activeBattleWatch = !!loadBattleWatch();
       if (window.frames && window.frames.d_act) return true;
       if (window.frames && window.frames.d_menu) return true;
       if (document.querySelector('frame[name="d_act"], iframe[name="d_act"]')) return true;
@@ -58,6 +121,7 @@
         href.includes("/animate_bid_") ||
         href.includes("/animate_all_")
       ) return true;
+      if (isActionFrame && activeBattleWatch) return true;
       return false;
     } catch (_e) {
       return true;
@@ -96,8 +160,37 @@
   const body = document.createElement("div");
   body.id = "apeha-helper-body";
 
+  const nav = document.createElement("div");
+  nav.id = "apeha-helper-nav";
+
+  const battleTabBtn = document.createElement("button");
+  battleTabBtn.type = "button";
+  battleTabBtn.className = "apeha-helper-tab-btn";
+  battleTabBtn.textContent = "Бой";
+
+  const gameTabBtn = document.createElement("button");
+  gameTabBtn.type = "button";
+  gameTabBtn.className = "apeha-helper-tab-btn";
+  gameTabBtn.textContent = "Игра";
+
   const watchArea = document.createElement("div");
   watchArea.id = "apeha-helper-watch-area";
+
+  const battleArea = document.createElement("div");
+  battleArea.id = "apeha-helper-battle-area";
+
+  const gameArea = document.createElement("div");
+  gameArea.id = "apeha-helper-game-area";
+
+  const gameMenu = document.createElement("div");
+  gameMenu.id = "apeha-helper-game-menu";
+
+  const gameMenuTitle = document.createElement("div");
+  gameMenuTitle.className = "apeha-helper-game-title";
+  gameMenuTitle.textContent = "Функции";
+
+  const gameFeatureList = document.createElement("div");
+  gameFeatureList.id = "apeha-helper-game-features";
 
 
   const blocksHost = document.createElement("div");
@@ -109,15 +202,6 @@
   addRowBtn.title = "Add row to current block";
   addRowBtn.textContent = "+";
 
-  const clearCacheBtn = document.createElement("button");
-  clearCacheBtn.id = "apeha-helper-clear-cache";
-  clearCacheBtn.type = "button";
-  clearCacheBtn.title = "Очистить кэш П/К";
-  clearCacheBtn.textContent = "Очистить кэш";
-
-  const debugBox = document.createElement("pre");
-  debugBox.id = "apeha-helper-debug";
-
   let watchBlocks = loadWatchBlocks();
   let watchHighlightFlags = loadWatchHighlightFlags();
   let watchTeamModes = loadWatchTeamModes();
@@ -125,16 +209,210 @@
   let suppressClick = false;
   let helperDisabled = localStorage.getItem(TOGGLE_HIDDEN_KEY) === "1";
   let refreshTimerId = 0;
+  let joinRoomRefreshTimeoutId = 0;
   let currentBattleId = "";
   const stickyBlackShield = new Set();
   let sidePanelClosedBattleId = "";
   let sidePanelPos = null;
+  let activeSection = loadMainTab();
+  let gameFeatures = loadGameFeatures();
   const rosterCtrlClickBoundDocs = new WeakSet();
   const mapCtrlClickBoundDocs = new WeakSet();
+  const joinTrackingBoundDocs = new WeakSet();
   syncWatchStateShape();
   saveWatchHighlightFlags();
   syncTeamModesShape();
   saveWatchTeamModes();
+
+  function loadMainTab() {
+    const value = localStorage.getItem(MAIN_TAB_KEY);
+    return value === "battle" || value === "game" ? value : "";
+  }
+
+  function saveMainTab() {
+    if (activeSection === "battle" || activeSection === "game") {
+      localStorage.setItem(MAIN_TAB_KEY, activeSection);
+    } else {
+      localStorage.removeItem(MAIN_TAB_KEY);
+    }
+  }
+
+  function normalizeGameFeatures(raw) {
+    const value = raw && typeof raw === "object" ? raw : {};
+    return {
+      requestHighlight: value.requestHighlight !== false,
+      soundEnabled: value.soundEnabled !== false
+    };
+  }
+
+  function loadGameFeatures() {
+    try {
+      return normalizeGameFeatures(JSON.parse(localStorage.getItem(GAME_FEATURES_KEY) || "null"));
+    } catch (_e) {
+      return normalizeGameFeatures(null);
+    }
+  }
+
+  function saveGameFeatures() {
+    localStorage.setItem(GAME_FEATURES_KEY, JSON.stringify(gameFeatures));
+  }
+
+  function readJson(key, fallback) {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key) || "null");
+      return parsed && typeof parsed === "object" ? parsed : fallback;
+    } catch (_e) {
+      return fallback;
+    }
+  }
+
+  function getJoinPageSignature(doc) {
+    try {
+      const href = String((doc && doc.location && doc.location.href) || window.location.href || "");
+      return href.replace(/#.*$/, "");
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  function loadLastJoinRequest() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(LAST_JOIN_REQUEST_KEY) || "null");
+      if (!parsed || typeof parsed !== "object") return null;
+      const joinId = String(parsed.joinId || "").trim();
+      if (!joinId) return null;
+      return {
+        joinId,
+        href: String(parsed.href || ""),
+        signature: String(parsed.signature || parsed.href || ""),
+        ts: Number(parsed.ts) || 0
+      };
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function saveLastJoinRequest(joinId, doc) {
+    const cleanedId = String(joinId || "").trim();
+    if (!cleanedId) return;
+    const signature = getJoinPageSignature(doc || document);
+    localStorage.setItem(LAST_JOIN_REQUEST_KEY, JSON.stringify({
+      joinId: cleanedId,
+      href: signature,
+      signature,
+      ts: Date.now()
+    }));
+  }
+
+  function normalizeBattleWatch(raw) {
+    const value = raw && typeof raw === "object" ? raw : {};
+    const source = value.source === "posted" ? "posted" : "join";
+    return {
+      active: value.active === true,
+      source,
+      joinId: String(value.joinId || "").trim(),
+      cancelId: String(value.cancelId || "").trim(),
+      signature: String(value.signature || value.href || ""),
+      startedAt: Number(value.startedAt) || 0,
+      lastSeenAt: Number(value.lastSeenAt) || 0,
+      signaled: value.signaled === true
+    };
+  }
+
+  function loadBattleWatch() {
+    const parsed = readJson(BATTLE_WATCH_KEY, null);
+    if (!parsed) return null;
+    const normalized = normalizeBattleWatch(parsed);
+    return normalized.active ? normalized : null;
+  }
+
+  function saveBattleWatch(state) {
+    const normalized = normalizeBattleWatch(state);
+    if (!normalized.active) {
+      localStorage.removeItem(BATTLE_WATCH_KEY);
+      return null;
+    }
+    localStorage.setItem(BATTLE_WATCH_KEY, JSON.stringify(normalized));
+    return normalized;
+  }
+
+  function clearBattleWatch() {
+    localStorage.removeItem(BATTLE_WATCH_KEY);
+  }
+
+  function getLastUserActivityTs() {
+    const raw = Number(localStorage.getItem(LAST_ACTIVITY_KEY) || "0");
+    return Number.isFinite(raw) ? raw : 0;
+  }
+
+  function isUserIdleForBattleWatch() {
+    return Date.now() - getLastUserActivityTs() >= IDLE_THRESHOLD_MS;
+  }
+
+  function touchBattleWatch(patch) {
+    const current = loadBattleWatch();
+    if (!current) return null;
+    return saveBattleWatch({
+      ...current,
+      ...patch,
+      active: true,
+      lastSeenAt: Date.now()
+    });
+  }
+
+  function startBattleWatchJoin(joinId, doc) {
+    const cleanedId = String(joinId || "").trim();
+    if (!cleanedId) return null;
+    const current = loadBattleWatch();
+    const now = Date.now();
+    return saveBattleWatch({
+      active: true,
+      source: "join",
+      joinId: cleanedId,
+      cancelId: "",
+      signature: getJoinPageSignature(doc || document),
+      startedAt: current && current.active && current.source === "join" && current.joinId === cleanedId ? current.startedAt : now,
+      lastSeenAt: now,
+      signaled: false
+    });
+  }
+
+  function startBattleWatchPosted(cancelId, doc) {
+    const cleanedCancelId = String(cancelId || "").trim();
+    const current = loadBattleWatch();
+    const now = Date.now();
+    return saveBattleWatch({
+      active: true,
+      source: "posted",
+      joinId: "",
+      cancelId: cleanedCancelId,
+      signature: getJoinPageSignature(doc || document),
+      startedAt: current && current.active && current.source === "posted" && current.cancelId === cleanedCancelId ? current.startedAt : now,
+      lastSeenAt: now,
+      signaled: false
+    });
+  }
+
+  function playBattleStartSignal() {
+    if (!gameFeatures.soundEnabled) return;
+    const ctx = ensureSharedAudioContext();
+    if (!ctx) return;
+    try {
+      if (ctx.state === "suspended" && typeof ctx.resume === "function") ctx.resume().catch(() => {});
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const now = typeof ctx.currentTime === "number" ? ctx.currentTime : 0;
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(880, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.08, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.34);
+    } catch (_e) {}
+  }
 
   function normalizeNick(s) {
     return (s || "")
@@ -268,29 +546,6 @@
       lastCurseRoundNo: roundNo,
       letterP: Array.from(letterPSet || []),
       letterK: Array.from(letterKSet || [])
-    };
-  }
-
-  function getBattleViewInfo(doc) {
-    let href = "";
-    let pathname = "";
-    try {
-      href = String(doc && doc.location && doc.location.href ? doc.location.href : "");
-      pathname = String(doc && doc.location && doc.location.pathname ? doc.location.pathname : "");
-    } catch (_e) {}
-    const lowerHref = href.toLowerCase();
-    const isAnimateHistory = /\/animate_bid_\d+_round_\d+_nobut_\d+\.html/.test(lowerHref);
-    const offsetMatch = lowerHref.match(/_round_(\d+)_nobut_/);
-    const roundOffset = offsetMatch && offsetMatch[1] ? Number(offsetMatch[1]) : NaN;
-    const battleId = detectBattleId(doc);
-    const viewKey = isAnimateHistory
-      ? `${battleId || pathname}|${pathname}|${Number.isFinite(roundOffset) ? roundOffset : "na"}`
-      : String(battleId || pathname || href || "");
-    return {
-      battleId: String(battleId || ""),
-      viewKey,
-      isAnimateHistory,
-      roundOffset
     };
   }
 
@@ -621,6 +876,308 @@
     return tracked;
   }
 
+  function isBattlePageDoc(doc) {
+    if (!doc) return false;
+    try {
+      const href = String((doc.location && doc.location.href) || "").toLowerCase();
+      if (
+        href.includes("/mbattle.html") ||
+        href.includes("/combat_bid_") ||
+        href.includes("/animate_bid_") ||
+        href.includes("/animate_all_") ||
+        href.includes("/endbattle.html")
+      ) return true;
+      if (doc.getElementById("aliveshow") || doc.getElementById("deadshow")) return true;
+      const scripts = doc.querySelectorAll("script");
+      for (let i = 0; i < scripts.length; i++) {
+        const content = scripts[i].textContent || scripts[i].innerText || "";
+        if (content.includes("var UNBS") && content.includes("var DEAD")) return true;
+      }
+    } catch (_e) {}
+    return false;
+  }
+
+  function findJoinForms(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") return [];
+    return Array.from(doc.querySelectorAll('form input[name="actBattle-Join"]')).map((input) => ({
+      input,
+      form: input.form || input.closest("form")
+    })).filter((entry) => entry.form);
+  }
+
+  function isJoinRequestPageDoc(doc) {
+    if (!doc || isBattlePageDoc(doc)) return false;
+    try {
+      const href = String((doc.location && doc.location.href) || "").toLowerCase();
+      const looksLikeArenaRoom = href.includes("arena_room") || href.includes("castle_cid");
+      if (!looksLikeArenaRoom) return false;
+    } catch (_e) {
+      return false;
+    }
+    return findJoinForms(doc).length > 0;
+  }
+
+  function clearJoinRequestHighlights(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") return;
+    doc.querySelectorAll(".apeha-helper-join-highlight").forEach((el) => {
+      el.classList.remove("apeha-helper-join-highlight");
+    });
+    doc.querySelectorAll(".apeha-helper-join-fist").forEach((el) => {
+      el.classList.remove("apeha-helper-join-fist");
+    });
+    doc.querySelectorAll(".apeha-helper-join-submit-disabled").forEach((el) => {
+      el.classList.remove("apeha-helper-join-submit-disabled");
+      if ("disabled" in el) el.disabled = false;
+      el.removeAttribute("aria-disabled");
+      if (el.dataset) delete el.dataset.apehaHelperBlockedJoin;
+      if (el.tagName === "INPUT") {
+        const originalTitle = el.dataset && el.dataset.apehaHelperOriginalTitle;
+        if (typeof originalTitle === "string") el.title = originalTitle;
+        if (el.dataset) delete el.dataset.apehaHelperOriginalTitle;
+      }
+    });
+  }
+
+  function clearJoinRoomAutoRefresh() {
+    if (joinRoomRefreshTimeoutId) {
+      window.clearTimeout(joinRoomRefreshTimeoutId);
+      joinRoomRefreshTimeoutId = 0;
+    }
+  }
+
+  function hasGoldJoinHighlights(doc) {
+    return !!(doc && typeof doc.querySelector === "function" && doc.querySelector(".apeha-helper-join-highlight"));
+  }
+
+  function getJoinRoomRefreshButton(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") return null;
+    const buttons = Array.from(doc.querySelectorAll('button[title="Обновить"], input[type="button"][title="Обновить"], input[type="submit"][title="Обновить"]'));
+    for (let i = 0; i < buttons.length; i++) {
+      const btn = buttons[i];
+      const onclick = String(btn.getAttribute("onclick") || "");
+      if (onclick.includes("actReload")) return btn;
+    }
+    return null;
+  }
+
+  function triggerJoinRoomRefresh() {
+    clearJoinRoomAutoRefresh();
+    const watch = loadBattleWatch();
+    if (helperDisabled || !gameFeatures.requestHighlight || !watch || !watch.active) return;
+    if (!isUserIdleForBattleWatch()) return;
+    if (isBattlePageDoc(document)) return;
+    const refreshButton = getJoinRoomRefreshButton(document);
+    if (!refreshButton) return;
+    try {
+      refreshButton.click();
+    } catch (_e) {
+      try {
+        if (typeof window.actReload === "function") window.actReload();
+      } catch (_e2) {}
+    }
+  }
+
+  function syncJoinRoomAutoRefresh() {
+    clearJoinRoomAutoRefresh();
+    const watch = loadBattleWatch();
+    if (helperDisabled || !gameFeatures.requestHighlight || !watch || !watch.active) return;
+    if (!isUserIdleForBattleWatch()) return;
+    if (isBattlePageDoc(document)) return;
+    if (!getJoinRoomRefreshButton(document)) return;
+    const delayMs = REFRESH_DELAY_MIN_MS + Math.floor(Math.random() * REFRESH_DELAY_RANGE_MS);
+    joinRoomRefreshTimeoutId = window.setTimeout(() => {
+      joinRoomRefreshTimeoutId = 0;
+      triggerJoinRoomRefresh();
+    }, delayMs);
+  }
+
+  function findJoinRequestContainer(form) {
+    if (!form || typeof form.closest !== "function") return null;
+    return form.closest("table.jtable") || form.closest("table") || form.parentElement;
+  }
+
+  function isFistJoinRequest(entry) {
+    const form = entry && entry.form ? entry.form : null;
+    const container = form ? findJoinRequestContainer(form) : null;
+    const text = String((container && (container.textContent || container.innerText)) || (form && (form.textContent || form.innerText)) || "");
+    return normalizeNick(text).includes(normalizeNick("Кулачный"));
+  }
+
+  function isOwnPostedJoinRequest(entry) {
+    const form = entry && entry.form ? entry.form : null;
+    const container = form ? findJoinRequestContainer(form) : null;
+    const text = String((container && (container.textContent || container.innerText)) || (form && (form.textContent || form.innerText)) || "");
+    return normalizeNick(text).includes(normalizeNick("Вы подали заявку"));
+  }
+
+  function getCancelButtonForEntry(entry) {
+    const form = entry && entry.form ? entry.form : null;
+    const container = form ? findJoinRequestContainer(form) : null;
+    if (container && typeof container.querySelector === "function") {
+      const btn = container.querySelector('input[type="button"][value="Отозвать"], button[value="Отозвать"]');
+      if (btn) return btn;
+    }
+    return null;
+  }
+
+  function extractCancelId(node) {
+    const onclick = String((node && node.getAttribute && node.getAttribute("onclick")) || "");
+    const match = onclick.match(/actBattle-Cancel_(\d+)/i);
+    return match && match[1] ? String(match[1]) : "";
+  }
+
+  function stopBattleWatch() {
+    clearBattleWatch();
+    localStorage.removeItem(LAST_JOIN_REQUEST_KEY);
+    clearJoinRoomAutoRefresh();
+  }
+
+  function maybeHandleBattleStart() {
+    const watch = loadBattleWatch();
+    if (!watch || !watch.active) return false;
+    if (!isBattlePageDoc(document)) return false;
+    touchBattleWatch({ signaled: true });
+    playBattleStartSignal();
+    stopBattleWatch();
+    clearJoinRequestHighlights(document);
+    return true;
+  }
+
+  function getJoinSubmitControls(form) {
+    if (!form || typeof form.querySelectorAll !== "function") return [];
+    return Array.from(form.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])'));
+  }
+
+  function setJoinFormBlocked(form, blocked) {
+    getJoinSubmitControls(form).forEach((control) => {
+      control.classList.toggle("apeha-helper-join-submit-disabled", !!blocked);
+      if ("disabled" in control) control.disabled = !!blocked;
+      if (blocked) {
+        control.setAttribute("aria-disabled", "true");
+        if (control.dataset) {
+          control.dataset.apehaHelperBlockedJoin = "1";
+          if (control.tagName === "INPUT") control.dataset.apehaHelperOriginalTitle = control.title || "";
+        }
+        control.title = "Кулачные заявки заблокированы helper";
+      } else {
+        control.removeAttribute("aria-disabled");
+        if (control.dataset) {
+          delete control.dataset.apehaHelperBlockedJoin;
+          if (control.tagName === "INPUT") {
+            const originalTitle = control.dataset.apehaHelperOriginalTitle;
+            control.title = typeof originalTitle === "string" ? originalTitle : "";
+            delete control.dataset.apehaHelperOriginalTitle;
+          }
+        } else {
+          control.title = "";
+        }
+      }
+    });
+  }
+
+  function refreshJoinRequestHighlights() {
+    clearJoinRequestHighlights(document);
+    if (helperDisabled || !gameFeatures.requestHighlight) {
+      stopBattleWatch();
+      return;
+    }
+    if (!isJoinRequestPageDoc(document)) {
+      clearJoinRoomAutoRefresh();
+      return;
+    }
+    const entries = findJoinForms(document);
+    let observedPosted = null;
+    let observedJoin = null;
+    const tracked = loadLastJoinRequest();
+    const currentSignature = getJoinPageSignature(document);
+
+    entries.forEach((entry) => {
+      if (!entry || !entry.form) return;
+      const container = findJoinRequestContainer(entry.form);
+      const isFist = isFistJoinRequest(entry);
+      if (container && isFist) container.classList.add("apeha-helper-join-fist");
+      if (container && isOwnPostedJoinRequest(entry)) {
+        container.classList.add("apeha-helper-join-highlight");
+        const cancelId = extractCancelId(getCancelButtonForEntry(entry));
+        if (cancelId) {
+          observedPosted = {
+            source: "posted",
+            cancelId,
+            signature: currentSignature
+          };
+        }
+      }
+      if (tracked && tracked.joinId) {
+        const joinId = String(entry.input.value || "").trim();
+        if (joinId && joinId === tracked.joinId && (!tracked.signature || tracked.signature === currentSignature)) {
+          if (container) container.classList.add("apeha-helper-join-highlight");
+          observedJoin = {
+            source: "join",
+            joinId,
+            signature: currentSignature
+          };
+        }
+      }
+      setJoinFormBlocked(entry.form, isFist);
+    });
+
+    if (observedPosted) {
+      startBattleWatchPosted(observedPosted.cancelId, document);
+    } else if (observedJoin) {
+      startBattleWatchJoin(observedJoin.joinId, document);
+    } else if (loadBattleWatch()) {
+      stopBattleWatch();
+    }
+    syncJoinRoomAutoRefresh();
+  }
+
+  function ensureJoinRequestTracking() {
+    if (!isJoinRequestPageDoc(document) || joinTrackingBoundDocs.has(document)) return;
+    joinTrackingBoundDocs.add(document);
+
+    document.addEventListener("submit", (e) => {
+      const form = e && e.target;
+      if (!form || typeof form.querySelector !== "function") return;
+      const joinInput = form.querySelector('input[name="actBattle-Join"]');
+      if (!joinInput) return;
+      if (gameFeatures.requestHighlight && isFistJoinRequest({ form, input: joinInput })) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      saveLastJoinRequest(joinInput.value, document);
+      startBattleWatchJoin(joinInput.value, document);
+    }, true);
+
+    document.addEventListener("click", (e) => {
+      const target = e && e.target;
+      if (!target || typeof target.closest !== "function") return;
+      const cancelBtn = target.closest('input[type="button"][value="Отозвать"], button[value="Отозвать"]');
+      if (cancelBtn) {
+        const cancelId = extractCancelId(cancelBtn);
+        const watch = loadBattleWatch();
+        if (watch && watch.active && watch.source === "posted" && cancelId && watch.cancelId === cancelId) {
+          stopBattleWatch();
+          clearJoinRequestHighlights(document);
+        }
+        return;
+      }
+      const submit = target.closest('input[type="submit"], button[type="submit"], button:not([type])');
+      if (!submit) return;
+      const form = submit.form || submit.closest("form");
+      if (!form || typeof form.querySelector !== "function") return;
+      const joinInput = form.querySelector('input[name="actBattle-Join"]');
+      if (!joinInput) return;
+      if (gameFeatures.requestHighlight && isFistJoinRequest({ form, input: joinInput })) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      saveLastJoinRequest(joinInput.value, document);
+      startBattleWatchJoin(joinInput.value, document);
+    }, true);
+  }
+
   function extractNickDisplayFromMapTitle(title) {
     let txt = (title || "").replace(/\[[^\]]*]\s*$/, "").trim();
     if (!txt) return "";
@@ -774,6 +1331,16 @@
     collectFromNode(doc.getElementById("deadshow"), "dead");
     collectFromNode(doc.getElementById("aliveshow"), "alive");
 
+    doc.querySelectorAll('img[id^="pr_"][title][src]').forEach((img) => {
+      const nick = extractNickFromMapTitle(img.getAttribute("title") || "");
+      if (!nick || isInvisibleNick(nick) || map.has(nick)) return;
+      const src = String(img.getAttribute("src") || "").toLowerCase();
+      let sd = null;
+      if (/(^|\/)pb0d?\.(png|gif)(\?|$)/.test(src) || /pb0d?\.(png|gif)/.test(src)) sd = 0;
+      if (/(^|\/)pb1d?\.(png|gif)(\?|$)/.test(src) || /pb1d?\.(png|gif)/.test(src)) sd = 1;
+      if (sd === 0 || sd === 1) map.set(nick, sd);
+    });
+
     try {
       const script = doc.createElement("script");
       script.textContent = `
@@ -841,23 +1408,15 @@
 
   function getCurrentRoundContext(doc) {
     const logsNode = doc && doc.getElementById ? doc.getElementById("logs") : null;
-    if (!logsNode) return { lines: [], linesNorm: [], htmlLines: [], text: "", previousLines: [], previousLinesNorm: [], previousHtmlLines: [], previousText: "", roundNo: NaN, roundNoCurrent: NaN, isRoundMarkerOnly: false, hasCurrentEvents: false };
+    if (!logsNode) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
     const text = (logsNode.innerText || logsNode.textContent || "").replace(/\r/g, "");
-    if (!text) return { lines: [], linesNorm: [], htmlLines: [], text: "", previousLines: [], previousLinesNorm: [], previousHtmlLines: [], previousText: "", roundNo: NaN, roundNoCurrent: NaN, isRoundMarkerOnly: false, hasCurrentEvents: false };
-    const html = String(logsNode.innerHTML || "").replace(/\r/g, "");
+    if (!text) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
 
-    const allLines = text
+    let lines = text
       .split("\n")
       .map((line) => String(line || "").replace(/\s+/g, " ").trim())
       .filter(Boolean);
-    const allHtmlLines = html
-      .split(/<br\s*\/?>/i)
-      .map((line) => String(line || "").trim())
-      .filter(Boolean);
-    if (!allLines.length) return { lines: [], linesNorm: [], htmlLines: [], text: "", previousLines: [], previousLinesNorm: [], previousHtmlLines: [], previousText: "", roundNo: NaN, roundNoCurrent: NaN, isRoundMarkerOnly: false, hasCurrentEvents: false };
-
-    let lines = allLines.slice();
-    let htmlLines = allHtmlLines.slice();
+    if (!lines.length) return { lines: [], linesNorm: [], text: "", previousLines: [], previousLinesNorm: [], previousText: "" };
 
     const getRoundNo = (line) => {
       const raw = String(line || "");
@@ -878,47 +1437,34 @@
     // events are always at the top and the first visible round marker closes
     // the current block.
     let previousLines = [];
-    let previousHtmlLines = [];
-    let roundNo = NaN;
-    let isRoundMarkerOnly = false;
     if (roundIndexes.length) {
       const firstRoundIdx = roundIndexes[0];
-      roundNo = getRoundNo(lines[firstRoundIdx]);
       lines = lines.slice(0, firstRoundIdx + 1);
-      htmlLines = htmlLines.slice(0, firstRoundIdx + 1);
       if (roundIndexes.length > 1) {
         const secondRoundIdx = roundIndexes[1];
-        previousLines = allLines.slice(firstRoundIdx + 1, secondRoundIdx + 1);
-        previousHtmlLines = allHtmlLines.slice(firstRoundIdx + 1, secondRoundIdx + 1);
+        previousLines = text
+          .split("\n")
+          .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(firstRoundIdx + 1, secondRoundIdx + 1);
       } else {
-        previousLines = allLines.slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, allLines.length));
-        previousHtmlLines = allHtmlLines.slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, allHtmlLines.length));
+        previousLines = text
+          .split("\n")
+          .map((line) => String(line || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, text.split("\n").length));
       }
     } else {
       lines = lines.slice(0, Math.min(lines.length, 100));
-      htmlLines = htmlLines.slice(0, Math.min(htmlLines.length, 100));
     }
-
-    const nonMarkerLines = lines.filter((line) => {
-      if (!line) return false;
-      return !Number.isFinite(getRoundNo(line));
-    });
-    isRoundMarkerOnly = nonMarkerLines.length === 0;
-    const hasCurrentEvents = nonMarkerLines.length > 0;
 
     return {
       lines,
       linesNorm: lines.map((line) => normalizeNick(line)),
-      htmlLines,
       text: lines.join("\n"),
       previousLines,
       previousLinesNorm: previousLines.map((line) => normalizeNick(line)),
-      previousHtmlLines,
-      previousText: previousLines.join("\n"),
-      roundNo,
-      roundNoCurrent: roundNo,
-      isRoundMarkerOnly,
-      hasCurrentEvents
+      previousText: previousLines.join("\n")
     };
   }
 
@@ -1018,24 +1564,6 @@
     return fallback;
   }
 
-  function decodeHtmlText(html) {
-    const el = document.createElement("div");
-    el.innerHTML = String(html || "");
-    return (el.textContent || el.innerText || "").replace(/\s+/g, " ").trim();
-  }
-
-  function inferTeamFromLogHtmlLine(lineHtml, nickNorm) {
-    if (!lineHtml || !nickNorm) return null;
-    const re = /<font[^>]*class=["']s([01])["'][^>]*>([\s\S]*?)<\/font>/ig;
-    let m;
-    while ((m = re.exec(String(lineHtml)))) {
-      const teamId = Number(m[1]);
-      const rawNick = decodeHtmlText(m[2]);
-      if ((teamId === 0 || teamId === 1) && normalizeNick(rawNick) === nickNorm) return teamId;
-    }
-    return null;
-  }
-
   function getCurrentRoundState(allNicks) {
     const blueShield = new Set();
     const blackShieldCurrent = new Set();
@@ -1043,44 +1571,27 @@
     const letterK = new Set();
     const letterPPrev = new Set();
     const letterKPrev = new Set();
-    const pkTeamHints = new Map();
-    const debug = {
-      roundNo: NaN,
-      battleId: "",
-      teams: { 0: null, 1: null },
-      letterP: [],
-      letterK: [],
-      letterPPrev: [],
-      letterKPrev: []
-    };
     const mad = new Set();
     const frozen = new Set();
     const feared = new Set();
     const revived = new Set();
 
     if (!allNicks || !allNicks.size) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, pkTeamHints, mad, frozen, feared, revived, debug };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
     }
 
     const battleDoc = resolveBattleDocument();
     if (!battleDoc) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, pkTeamHints, mad, frozen, feared, revived, debug };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
     }
 
     syncBattleScope(battleDoc);
     const round = getCurrentRoundContext(battleDoc);
     const lines = round.linesNorm;
-    const htmlLines = round.htmlLines || [];
     if (!lines.length) {
-      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, pkTeamHints, mad, frozen, feared, revived, debug };
+      return { blueShield, blackShield: new Set(stickyBlackShield), letterP, letterK, letterPPrev, letterKPrev, mad, frozen, feared, revived };
     }
     const previousLines = round.previousLinesNorm || [];
-    const previousHtmlLines = round.previousHtmlLines || [];
-    const roundNo = Number.isFinite(round.roundNoCurrent) ? round.roundNoCurrent : (Number.isFinite(round.roundNo) ? round.roundNo : NaN);
-    const battleId = detectBattleId(battleDoc) || currentBattleId || "";
-    const teamMap = getNickTeamMap().map;
-    debug.roundNo = roundNo;
-    debug.battleId = battleId;
 
     const nicks = Array.from(allNicks).filter((nick) => !isInvisibleNick(nick));
     const blueTokens = [
@@ -1117,22 +1628,10 @@
         findActorsInLine(lineNorm, blackToken, nicks).forEach((nick) => blackShieldCurrent.add(nick));
       }
       if (lineNorm.includes(pToken)) {
-        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => {
-          letterP.add(nick);
-          if (!pkTeamHints.has(nick)) {
-            const inferred = inferTeamFromLogHtmlLine(htmlLines[idx], nick);
-            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
-          }
-        });
+        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => letterP.add(nick));
       }
       if (lineNorm.includes(kToken)) {
-        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => {
-          letterK.add(nick);
-          if (!pkTeamHints.has(nick)) {
-            const inferred = inferTeamFromLogHtmlLine(htmlLines[idx], nick);
-            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
-          }
-        });
+        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => letterK.add(nick));
       }
       if (madnessTokens.some((token) => lineNorm.includes(token))) {
         nicks.forEach((nick) => {
@@ -1161,105 +1660,14 @@
       if (lineNorm.includes(pToken)) {
         findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => {
           if (!letterP.has(nick)) letterPPrev.add(nick);
-          if (!pkTeamHints.has(nick)) {
-            const inferred = inferTeamFromLogHtmlLine(previousHtmlLines[idx], nick);
-            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
-          }
         });
       }
       if (lineNorm.includes(kToken)) {
         findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => {
           if (!letterK.has(nick)) letterKPrev.add(nick);
-          if (!pkTeamHints.has(nick)) {
-            const inferred = inferTeamFromLogHtmlLine(previousHtmlLines[idx], nick);
-            if (inferred === 0 || inferred === 1) pkTeamHints.set(nick, inferred);
-          }
         });
       }
     });
-
-    if (Number.isFinite(roundNo) && battleId) {
-      const cache = loadRoundStatusCache();
-      const currentLetterPByTeam = new Map([[0, new Set()], [1, new Set()]]);
-      const currentLetterKByTeam = new Map([[0, new Set()], [1, new Set()]]);
-      const previousLetterPByTeam = new Map([[0, new Set()], [1, new Set()]]);
-      const previousLetterKByTeam = new Map([[0, new Set()], [1, new Set()]]);
-
-      letterP.forEach((nick) => {
-        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
-        if (teamId === 0 || teamId === 1) {
-          currentLetterPByTeam.get(teamId).add(nick);
-          pkTeamHints.set(nick, teamId);
-        }
-      });
-      letterK.forEach((nick) => {
-        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
-        if (teamId === 0 || teamId === 1) {
-          currentLetterKByTeam.get(teamId).add(nick);
-          pkTeamHints.set(nick, teamId);
-        }
-      });
-      letterPPrev.forEach((nick) => {
-        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
-        if (teamId === 0 || teamId === 1) {
-          previousLetterPByTeam.get(teamId).add(nick);
-          pkTeamHints.set(nick, teamId);
-        }
-      });
-      letterKPrev.forEach((nick) => {
-        const teamId = teamMap.has(nick) ? teamMap.get(nick) : pkTeamHints.get(nick);
-        if (teamId === 0 || teamId === 1) {
-          previousLetterKByTeam.get(teamId).add(nick);
-          pkTeamHints.set(nick, teamId);
-        }
-      });
-
-      const cachedBattle = cache[battleId];
-      const cachedTeams = cachedBattle && cachedBattle.teams && typeof cachedBattle.teams === "object" ? cachedBattle.teams : {};
-      debug.teams[0] = cachedTeams["0"] ? Number(cachedTeams["0"].lastCurseRoundNo) : null;
-      debug.teams[1] = cachedTeams["1"] ? Number(cachedTeams["1"].lastCurseRoundNo) : null;
-      ["0", "1"].forEach((teamKey) => {
-        const teamEntry = cachedTeams[teamKey];
-        if (!teamEntry) return;
-        const delta = roundNo - Number(teamEntry.lastCurseRoundNo);
-        if (delta !== 1 && delta !== 2) return;
-        toStringArray(teamEntry.letterP).forEach((nick) => {
-          const normalized = normalizeNick(nick);
-          if (!normalized || letterP.has(normalized)) return;
-          pkTeamHints.set(normalized, Number(teamKey));
-          letterPPrev.add(normalized);
-        });
-        toStringArray(teamEntry.letterK).forEach((nick) => {
-          const normalized = normalizeNick(nick);
-          if (!normalized || letterK.has(normalized)) return;
-          pkTeamHints.set(normalized, Number(teamKey));
-          letterKPrev.add(normalized);
-        });
-      });
-
-      writeRoundStatusCache(cache, battleId, roundNo, letterP, letterK);
-      if (roundNo > 1 && (letterPPrev.size || letterKPrev.size)) {
-        writeRoundStatusCache(cache, battleId, roundNo - 1, letterPPrev, letterKPrev);
-      }
-      [0, 1].forEach((teamId) => {
-        const teamLetterP = currentLetterPByTeam.get(teamId);
-        if (!teamLetterP || !teamLetterP.size) return;
-        writeTeamCurseCache(cache, battleId, teamId, roundNo, teamLetterP, currentLetterKByTeam.get(teamId));
-      });
-      if (roundNo > 1) {
-        [0, 1].forEach((teamId) => {
-          const prevTeamLetterP = previousLetterPByTeam.get(teamId);
-          if (!prevTeamLetterP || !prevTeamLetterP.size) return;
-          writeTeamCurseCache(cache, battleId, teamId, roundNo - 1, prevTeamLetterP, previousLetterKByTeam.get(teamId));
-        });
-      }
-      saveRoundStatusCache(cache);
-    }
-
-    debug.letterP = Array.from(letterP);
-    debug.letterK = Array.from(letterK);
-    debug.letterPPrev = Array.from(letterPPrev);
-    debug.letterKPrev = Array.from(letterKPrev);
 
     blackShieldCurrent.forEach((nick) => stickyBlackShield.add(nick));
     return {
@@ -1269,31 +1677,173 @@
       letterK,
       letterPPrev,
       letterKPrev,
-      pkTeamHints,
       mad,
       frozen,
       feared,
-      revived,
-      debug
+      revived
     };
   }
 
-  function renderDebugInfo(roundState) {
-    if (!debugBox) return;
-    const debug = roundState && roundState.debug ? roundState.debug : null;
-    if (!debug) {
-      debugBox.textContent = "";
-      return;
+  function decodeHtmlText(html) {
+    const el = document.createElement("div");
+    el.innerHTML = String(html || "");
+    return (el.textContent || el.innerText || "").replace(/\s+/g, " ").trim();
+  }
+
+  function inferTeamFromLogHtmlLine(lineHtml, nickNorm) {
+    if (!lineHtml || !nickNorm) return null;
+    const re = /<font[^>]*class=["']s([01])["'][^>]*>([\s\S]*?)<\/font>/ig;
+    let m;
+    while ((m = re.exec(String(lineHtml)))) {
+      const teamId = Number(m[1]);
+      const rawNick = decodeHtmlText(m[2]);
+      if ((teamId === 0 || teamId === 1) && normalizeNick(rawNick) === nickNorm) return teamId;
     }
-    const fmt = (arr) => Array.isArray(arr) && arr.length ? arr.join(", ") : "-";
-    debugBox.textContent = [
-      `r=${Number.isFinite(debug.roundNo) ? debug.roundNo : "na"} bid=${debug.battleId || "-"}`,
-      `t0=${debug.teams && debug.teams[0] !== null ? debug.teams[0] : "-"} t1=${debug.teams && debug.teams[1] !== null ? debug.teams[1] : "-"}`,
-      `P=${fmt(debug.letterP)}`,
-      `K=${fmt(debug.letterK)}`,
-      `Pp=${fmt(debug.letterPPrev)}`,
-      `Kp=${fmt(debug.letterKPrev)}`
-    ].join("\n");
+    return null;
+  }
+
+  function getPkCarryoverContext(doc) {
+    const logsNode = doc && doc.getElementById ? doc.getElementById("logs") : null;
+    if (!logsNode) return null;
+    const text = (logsNode.innerText || logsNode.textContent || "").replace(/\r/g, "");
+    if (!text) return null;
+    const html = String(logsNode.innerHTML || "").replace(/\r/g, "");
+    const allLines = text.split("\n").map((line) => String(line || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    const allHtmlLines = html.split(/<br\s*\/?>/i).map((line) => String(line || "").trim()).filter(Boolean);
+    if (!allLines.length) return null;
+
+    const getRoundNo = (line) => {
+      const raw = String(line || "");
+      const mRaw = raw.match(/раунд\s*(?:№|#)?\s*(\d+)/i);
+      if (mRaw && mRaw[1]) return Number(mRaw[1]);
+      const norm = normalizeNick(raw);
+      const mNorm = norm.match(/раунд(\d+)/i);
+      if (mNorm && mNorm[1]) return Number(mNorm[1]);
+      return NaN;
+    };
+
+    const roundIndexes = [];
+    allLines.forEach((line, idx) => {
+      if (Number.isFinite(getRoundNo(line))) roundIndexes.push(idx);
+    });
+
+    let currentLines = allLines.slice();
+    let currentHtmlLines = allHtmlLines.slice();
+    let previousLines = [];
+    let previousHtmlLines = [];
+    let roundNo = NaN;
+    if (roundIndexes.length) {
+      const firstRoundIdx = roundIndexes[0];
+      roundNo = getRoundNo(allLines[firstRoundIdx]);
+      currentLines = allLines.slice(0, firstRoundIdx + 1);
+      currentHtmlLines = allHtmlLines.slice(0, firstRoundIdx + 1);
+      if (roundIndexes.length > 1) {
+        const secondRoundIdx = roundIndexes[1];
+        previousLines = allLines.slice(firstRoundIdx + 1, secondRoundIdx + 1);
+        previousHtmlLines = allHtmlLines.slice(firstRoundIdx + 1, secondRoundIdx + 1);
+      } else {
+        previousLines = allLines.slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, allLines.length));
+        previousHtmlLines = allHtmlLines.slice(firstRoundIdx + 1, Math.min(firstRoundIdx + 101, allHtmlLines.length));
+      }
+    } else {
+      currentLines = allLines.slice(0, Math.min(allLines.length, 100));
+      currentHtmlLines = allHtmlLines.slice(0, Math.min(allHtmlLines.length, 100));
+    }
+
+    return {
+      roundNo,
+      currentLinesNorm: currentLines.map((line) => normalizeNick(line)),
+      currentHtmlLines,
+      previousLinesNorm: previousLines.map((line) => normalizeNick(line)),
+      previousHtmlLines
+    };
+  }
+
+  function collectPkTeams(linesNorm, htmlLines, nicks, teamMap) {
+    const pToken = normalizeNick("проклясть противника");
+    const kToken = normalizeNick("боевой клич");
+    const letterPByTeam = new Map([[0, new Set()], [1, new Set()]]);
+    const letterKByTeam = new Map([[0, new Set()], [1, new Set()]]);
+    linesNorm.forEach((lineNorm, idx) => {
+      if (!lineNorm) return;
+      if (lineNorm.includes(pToken)) {
+        findActorsInLine(lineNorm, pToken, nicks).forEach((nick) => {
+          let teamId = teamMap.get(nick);
+          if (teamId !== 0 && teamId !== 1) teamId = inferTeamFromLogHtmlLine((htmlLines || [])[idx], nick);
+          if (teamId === 0 || teamId === 1) {
+            teamMap.set(nick, teamId);
+            letterPByTeam.get(teamId).add(nick);
+          }
+        });
+      }
+      if (lineNorm.includes(kToken)) {
+        findActorsInLine(lineNorm, kToken, nicks).forEach((nick) => {
+          let teamId = teamMap.get(nick);
+          if (teamId !== 0 && teamId !== 1) teamId = inferTeamFromLogHtmlLine((htmlLines || [])[idx], nick);
+          if (teamId === 0 || teamId === 1) {
+            teamMap.set(nick, teamId);
+            letterKByTeam.get(teamId).add(nick);
+          }
+        });
+      }
+    });
+    return { letterPByTeam, letterKByTeam };
+  }
+
+  function applyPkCarryover(baseRoundState, battleDoc, allNicks, teamMap) {
+    if (!baseRoundState || !battleDoc || !teamMap) return baseRoundState;
+    const battleId = detectBattleId(battleDoc) || currentBattleId || "";
+    const ctx = getPkCarryoverContext(battleDoc);
+    if (!battleId || !ctx || !Number.isFinite(ctx.roundNo)) return baseRoundState;
+
+    const nicks = Array.from(allNicks || []).filter((nick) => !isInvisibleNick(nick));
+    const cache = loadRoundStatusCache();
+    const currentTeams = collectPkTeams(ctx.currentLinesNorm || [], ctx.currentHtmlLines || [], nicks, teamMap);
+    const previousTeams = collectPkTeams(ctx.previousLinesNorm || [], ctx.previousHtmlLines || [], nicks, teamMap);
+
+    [0, 1].forEach((teamId) => {
+      const teamLetterP = currentTeams.letterPByTeam.get(teamId);
+      if (teamLetterP && teamLetterP.size) {
+        writeTeamCurseCache(cache, battleId, teamId, ctx.roundNo, teamLetterP, currentTeams.letterKByTeam.get(teamId));
+        return;
+      }
+      if (ctx.roundNo > 1) {
+        const prevTeamLetterP = previousTeams.letterPByTeam.get(teamId);
+        if (prevTeamLetterP && prevTeamLetterP.size) {
+          writeTeamCurseCache(cache, battleId, teamId, ctx.roundNo - 1, prevTeamLetterP, previousTeams.letterKByTeam.get(teamId));
+        }
+      }
+    });
+    saveRoundStatusCache(cache);
+
+    const letterPPrev = new Set(baseRoundState.letterPPrev || []);
+    const letterKPrev = new Set(baseRoundState.letterKPrev || []);
+    const cachedBattle = cache[battleId];
+    const cachedTeams = cachedBattle && cachedBattle.teams && typeof cachedBattle.teams === "object" ? cachedBattle.teams : {};
+    ["0", "1"].forEach((teamKey) => {
+      const teamEntry = cachedTeams[teamKey];
+      if (!teamEntry) return;
+      const delta = ctx.roundNo - Number(teamEntry.lastCurseRoundNo);
+      if (delta !== 1 && delta !== 2) return;
+      toStringArray(teamEntry.letterP).forEach((nick) => {
+        const normalized = normalizeNick(nick);
+        if (!normalized || baseRoundState.letterP.has(normalized)) return;
+        teamMap.set(normalized, Number(teamKey));
+        letterPPrev.add(normalized);
+      });
+      toStringArray(teamEntry.letterK).forEach((nick) => {
+        const normalized = normalizeNick(nick);
+        if (!normalized || baseRoundState.letterK.has(normalized)) return;
+        teamMap.set(normalized, Number(teamKey));
+        letterKPrev.add(normalized);
+      });
+    });
+
+    return {
+      ...baseRoundState,
+      letterPPrev,
+      letterKPrev
+    };
   }
 
   function filterNicksByTeam(set, teamMap, selectedTeam) {
@@ -1455,6 +2005,10 @@
     if (layer) layer.remove();
   }
 
+  function isBattleSectionOpen() {
+    return !root.classList.contains("is-collapsed") && activeSection === "battle";
+  }
+
   function renderIconBadges(doc, img, badgeSets, nick) {
     if (!nick || isInvisibleNick(nick)) return;
     const badges = [];
@@ -1486,8 +2040,11 @@
   }
 
   function refreshMapHighlights() {
-    if (helperDisabled) return;
     const battleDoc = resolveBattleDocument();
+    if (helperDisabled || !isBattleSectionOpen()) {
+      clearBattleDecorations(battleDoc);
+      return;
+    }
     if (!battleDoc) return;
     const icons = battleDoc.querySelectorAll('img[id^="pr_"][title]');
     if (!icons.length) {
@@ -1516,13 +2073,8 @@
     });
     const displayNameMap = getNickDisplayMap(battleDoc, icons);
 
-    const roundState = getCurrentRoundState(allNicks);
-    renderDebugInfo(roundState);
-    if (roundState.pkTeamHints && typeof roundState.pkTeamHints.forEach === "function") {
-      roundState.pkTeamHints.forEach((teamId, nick) => {
-        if (!teamMap.has(nick) && (teamId === 0 || teamId === 1)) teamMap.set(nick, teamId);
-      });
-    }
+    const baseRoundState = getCurrentRoundState(allNicks);
+    const roundState = applyPkCarryover(baseRoundState, battleDoc, allNicks, teamMap);
     const revivedDisabled = new Set();
     roundState.revived.forEach((nick) => {
       const img = nickToImg.get(nick);
@@ -1684,6 +2236,18 @@
 
   function refreshInputStatuses() {
     if (helperDisabled) {
+      stopBattleWatch();
+      clearBattleDecorations(resolveBattleDocument());
+      clearJoinRequestHighlights(document);
+      return;
+    }
+    if (maybeHandleBattleStart()) {
+      clearJoinRequestHighlights(document);
+    }
+    ensureJoinRequestTracking();
+    refreshJoinRequestHighlights();
+    syncJoinRoomAutoRefresh();
+    if (!isBattleSectionOpen()) {
       clearBattleDecorations(resolveBattleDocument());
       return;
     }
@@ -1740,8 +2304,90 @@
   function normalizeHelperWidth() {
     panel.style.removeProperty("width");
     body.style.removeProperty("width");
+    nav.style.removeProperty("width");
+    battleArea.style.removeProperty("width");
     watchArea.style.removeProperty("width");
+    gameArea.style.removeProperty("width");
     blocksHost.style.removeProperty("width");
+  }
+
+  function renderGameMenu() {
+    gameFeatureList.innerHTML = "";
+
+    const appendGameFeature = (checked, titleText, descText, onChange) => {
+      const item = document.createElement("label");
+      item.className = "apeha-helper-game-item";
+
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = !!checked;
+      box.addEventListener("change", () => {
+        onChange(!!box.checked);
+      });
+
+      const textWrap = document.createElement("span");
+      textWrap.className = "apeha-helper-game-item-text";
+
+      const title = document.createElement("span");
+      title.className = "apeha-helper-game-item-title";
+      title.textContent = titleText;
+
+      const desc = document.createElement("span");
+      desc.className = "apeha-helper-game-item-desc";
+      desc.textContent = descText;
+
+      textWrap.appendChild(title);
+      textWrap.appendChild(desc);
+      item.appendChild(box);
+      item.appendChild(textWrap);
+      gameFeatureList.appendChild(item);
+    };
+
+    appendGameFeature(
+      gameFeatures.requestHighlight,
+      "Подсветка заявки",
+      "Подсвечивает свои заявки, следит за началом боя и обновляет d_act при бездействии.",
+      (checked) => {
+        gameFeatures.requestHighlight = checked;
+        saveGameFeatures();
+        if (!checked) {
+          stopBattleWatch();
+          clearJoinRequestHighlights(document);
+        }
+        refreshJoinRequestHighlights();
+      }
+    );
+
+    appendGameFeature(
+      gameFeatures.soundEnabled,
+      "Звук",
+      "Короткий однократный сигнал при первом обнаружении начала боя.",
+      (checked) => {
+        gameFeatures.soundEnabled = checked;
+        saveGameFeatures();
+      }
+    );
+  }
+
+  function applySectionState() {
+    const menuOpen = !root.classList.contains("is-collapsed");
+    const battleOpen = menuOpen && activeSection === "battle";
+    const gameOpen = menuOpen && activeSection === "game";
+    root.setAttribute("data-active-section", activeSection || "none");
+    battleArea.classList.toggle("is-open", battleOpen);
+    gameArea.classList.toggle("is-open", gameOpen);
+    battleTabBtn.classList.toggle("active", battleOpen);
+    gameTabBtn.classList.toggle("active", gameOpen);
+    if (!battleOpen) clearBattleDecorations(resolveBattleDocument());
+  }
+
+  function toggleSection(tabName) {
+    const nextSection = tabName === "game" ? "game" : "battle";
+    activeSection = activeSection === nextSection ? "" : nextSection;
+    saveMainTab();
+    applySectionState();
+    normalizeHelperWidth();
+    if (!helperDisabled && isBattleSectionOpen()) refreshInputStatuses();
   }
 
   function renderWatchBlocks() {
@@ -1920,13 +2566,6 @@
     renderWatchBlocks();
   });
 
-  clearCacheBtn.addEventListener("click", () => {
-    try {
-      localStorage.removeItem(ROUND_STATUS_CACHE_KEY);
-    } catch (_e) {}
-    refreshInputStatuses();
-  });
-
   function savePanelOpen(isOpen) {
     localStorage.setItem(PANEL_OPEN_KEY, isOpen ? "1" : "0");
   }
@@ -1938,14 +2577,24 @@
   const openPanel = () => {
     root.classList.remove("is-collapsed");
     savePanelOpen(true);
+    applySectionState();
   };
   const closePanel = () => {
     root.classList.add("is-collapsed");
+    activeSection = "";
     savePanelOpen(false);
+    saveMainTab();
+    applySectionState();
   };
   const togglePanel = () => {
+    const willOpen = root.classList.contains("is-collapsed");
     root.classList.toggle("is-collapsed");
-    savePanelOpen(!root.classList.contains("is-collapsed"));
+    if (!willOpen) {
+      activeSection = "";
+      saveMainTab();
+    }
+    savePanelOpen(willOpen);
+    applySectionState();
   };
 
   function applyHiddenState(hidden) {
@@ -1953,7 +2602,9 @@
     localStorage.setItem(TOGGLE_HIDDEN_KEY, helperDisabled ? "1" : "0");
     if (helperDisabled) {
       root.style.display = "none";
+      stopBattleWatch();
       clearBattleDecorations(resolveBattleDocument());
+      clearJoinRequestHighlights(document);
     } else {
       root.style.display = "";
       refreshInputStatuses();
@@ -2058,14 +2709,28 @@
   }
 
   toggle.addEventListener("mousedown", startDrag);
+  nav.appendChild(battleTabBtn);
+  nav.appendChild(gameTabBtn);
+  gameMenu.appendChild(gameMenuTitle);
+  gameMenu.appendChild(gameFeatureList);
+  gameArea.appendChild(gameMenu);
   watchArea.appendChild(blocksHost);
-  body.appendChild(watchArea);
-  body.appendChild(addRowBtn);
-  body.appendChild(clearCacheBtn);
-  body.appendChild(debugBox);
+  battleArea.appendChild(watchArea);
+  battleArea.appendChild(addRowBtn);
+  body.appendChild(nav);
   panel.appendChild(body);
   root.appendChild(toggle);
   root.appendChild(panel);
+  root.appendChild(battleArea);
+  root.appendChild(gameArea);
+
+  battleTabBtn.addEventListener("click", () => {
+    toggleSection("battle");
+  });
+
+  gameTabBtn.addEventListener("click", () => {
+    toggleSection("game");
+  });
 
   (document.body || document.documentElement).appendChild(root);
   applyPosition(readPosition());
@@ -2075,7 +2740,9 @@
   }
   if (isPanelOpenSaved()) openPanel();
   else closePanel();
+  renderGameMenu();
   renderWatchBlocks();
+  applySectionState();
   refreshTimerId = window.setInterval(() => {
     if (!helperDisabled) refreshInputStatuses();
   }, 1000);
