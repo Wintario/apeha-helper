@@ -130,37 +130,64 @@
 
 .apeha-helper-game-item {
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 5px 6px;
-  border: 1px solid #d3bc8f;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 5px;
+  border: 1px solid #ccb483;
   border-radius: 4px;
   background: #f5ecd5;
+  cursor: default;
+}
+
+.apeha-helper-game-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.apeha-helper-game-item-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   cursor: pointer;
 }
 
-.apeha-helper-game-item input[type="checkbox"] {
-  margin: 1px 0 0;
+.apeha-helper-game-item-toggle input[type="checkbox"] {
+  margin: 0;
+  width: 14px;
+  height: 14px;
   accent-color: #c2921d;
-}
-
-.apeha-helper-game-item-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+  flex: 0 0 auto;
 }
 
 .apeha-helper-game-item-title {
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 700;
   color: #7f0d0d;
+  line-height: 1.1;
 }
 
 .apeha-helper-game-item-desc {
-  font-size: 10px;
-  line-height: 1.3;
+  font-size: 9px;
+  line-height: 1.1;
   color: #765733;
+  min-height: 0;
 }
+
+.apeha-helper-game-item-toggle-sound {
+  align-items: center;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.apeha-helper-game-item-subtitle {
+  font-size: 9px;
+  font-weight: 700;
+  color: #8f1414;
+  line-height: 1;
+}
+
 
 #apeha-helper-team-stats {
   margin-bottom: 4px;

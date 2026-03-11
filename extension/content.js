@@ -399,18 +399,27 @@
     if (!ctx) return;
     try {
       if (ctx.state === "suspended" && typeof ctx.resume === "function") ctx.resume().catch(() => {});
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
       const now = typeof ctx.currentTime === "number" ? ctx.currentTime : 0;
-      osc.type = "sine";
-      osc.frequency.setValueAtTime(880, now);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.08, now + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.34);
+      [
+        [0, 660, 0.08, "square", 0.045],
+        [0.1, 880, 0.08, "square", 0.045],
+        [0.2, 1320, 0.14, "square", 0.045]
+      ].forEach((step) => {
+        const [offset, freq, duration, type, volume] = step;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const startAt = now + offset;
+        const stopAt = startAt + duration;
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, startAt);
+        gain.gain.setValueAtTime(0.0001, startAt);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, volume), startAt + Math.min(0.025, duration / 3));
+        gain.gain.exponentialRampToValueAtTime(0.0001, stopAt);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(startAt);
+        osc.stop(stopAt + 0.01);
+      });
     } catch (_e) {}
   }
 
@@ -905,6 +914,11 @@
     })).filter((entry) => entry.form);
   }
 
+  function findRequestCards(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") return [];
+    return Array.from(doc.querySelectorAll("table.jtable"));
+  }
+
   function isJoinRequestPageDoc(doc) {
     if (!doc || isBattlePageDoc(doc)) return false;
     try {
@@ -914,7 +928,11 @@
     } catch (_e) {
       return false;
     }
-    return findJoinForms(doc).length > 0;
+    if (findJoinForms(doc).length > 0) return true;
+    return findRequestCards(doc).some((card) => {
+      const text = normalizeNick(card.textContent || card.innerText || "");
+      return text.includes(normalizeNick("Вы подали заявку")) || text.includes(normalizeNick("Отозвать"));
+    });
   }
 
   function clearJoinRequestHighlights(doc) {
@@ -996,6 +1014,10 @@
     return form.closest("table.jtable") || form.closest("table") || form.parentElement;
   }
 
+  function getCardText(card) {
+    return String((card && (card.textContent || card.innerText)) || "");
+  }
+
   function isFistJoinRequest(entry) {
     const form = entry && entry.form ? entry.form : null;
     const container = form ? findJoinRequestContainer(form) : null;
@@ -1005,12 +1027,15 @@
 
   function isOwnPostedJoinRequest(entry) {
     const form = entry && entry.form ? entry.form : null;
-    const container = form ? findJoinRequestContainer(form) : null;
-    const text = String((container && (container.textContent || container.innerText)) || (form && (form.textContent || form.innerText)) || "");
+    const container = entry && entry.container
+      ? entry.container
+      : (form ? findJoinRequestContainer(form) : null);
+    const text = getCardText(container || form);
     return normalizeNick(text).includes(normalizeNick("Вы подали заявку"));
   }
 
   function getCancelButtonForEntry(entry) {
+    if (entry && entry.cancelButton) return entry.cancelButton;
     const form = entry && entry.form ? entry.form : null;
     const container = form ? findJoinRequestContainer(form) : null;
     if (container && typeof container.querySelector === "function") {
@@ -1086,6 +1111,7 @@
       return;
     }
     const entries = findJoinForms(document);
+    const cards = findRequestCards(document);
     let observedPosted = null;
     let observedJoin = null;
     const tracked = loadLastJoinRequest();
@@ -1119,6 +1145,24 @@
         }
       }
       setJoinFormBlocked(entry.form, isFist);
+    });
+
+    cards.forEach((card) => {
+      const entry = {
+        form: card.querySelector("form"),
+        container: card,
+        cancelButton: card.querySelector('input[type="button"][value="Отозвать"], button[value="Отозвать"]')
+      };
+      if (!isOwnPostedJoinRequest(entry)) return;
+      card.classList.add("apeha-helper-join-highlight");
+      const cancelId = extractCancelId(entry.cancelButton);
+      if (cancelId) {
+        observedPosted = {
+          source: "posted",
+          cancelId,
+          signature: currentSignature
+        };
+      }
     });
 
     if (observedPosted) {
@@ -2313,60 +2357,61 @@
 
   function renderGameMenu() {
     gameFeatureList.innerHTML = "";
+    const item = document.createElement("div");
+    item.className = "apeha-helper-game-item";
 
-    const appendGameFeature = (checked, titleText, descText, onChange) => {
-      const item = document.createElement("label");
-      item.className = "apeha-helper-game-item";
+    const topRow = document.createElement("div");
+    topRow.className = "apeha-helper-game-item-row";
 
-      const box = document.createElement("input");
-      box.type = "checkbox";
-      box.checked = !!checked;
-      box.addEventListener("change", () => {
-        onChange(!!box.checked);
-      });
+    const mainToggle = document.createElement("label");
+    mainToggle.className = "apeha-helper-game-item-toggle";
 
-      const textWrap = document.createElement("span");
-      textWrap.className = "apeha-helper-game-item-text";
-
-      const title = document.createElement("span");
-      title.className = "apeha-helper-game-item-title";
-      title.textContent = titleText;
-
-      const desc = document.createElement("span");
-      desc.className = "apeha-helper-game-item-desc";
-      desc.textContent = descText;
-
-      textWrap.appendChild(title);
-      textWrap.appendChild(desc);
-      item.appendChild(box);
-      item.appendChild(textWrap);
-      gameFeatureList.appendChild(item);
-    };
-
-    appendGameFeature(
-      gameFeatures.requestHighlight,
-      "Подсветка заявки",
-      "Подсвечивает свои заявки, следит за началом боя и обновляет d_act при бездействии.",
-      (checked) => {
-        gameFeatures.requestHighlight = checked;
-        saveGameFeatures();
-        if (!checked) {
-          stopBattleWatch();
-          clearJoinRequestHighlights(document);
-        }
-        refreshJoinRequestHighlights();
+    const mainBox = document.createElement("input");
+    mainBox.type = "checkbox";
+    mainBox.checked = !!gameFeatures.requestHighlight;
+    mainBox.addEventListener("change", () => {
+      gameFeatures.requestHighlight = !!mainBox.checked;
+      saveGameFeatures();
+      if (!mainBox.checked) {
+        stopBattleWatch();
+        clearJoinRequestHighlights(document);
       }
-    );
+      refreshJoinRequestHighlights();
+    });
 
-    appendGameFeature(
-      gameFeatures.soundEnabled,
-      "Звук",
-      "Короткий однократный сигнал при первом обнаружении начала боя.",
-      (checked) => {
-        gameFeatures.soundEnabled = checked;
-        saveGameFeatures();
-      }
-    );
+    const title = document.createElement("span");
+    title.className = "apeha-helper-game-item-title";
+    title.textContent = "Подсветка заявки";
+
+    const soundToggle = document.createElement("label");
+    soundToggle.className = "apeha-helper-game-item-toggle apeha-helper-game-item-toggle-sound";
+
+    const soundBox = document.createElement("input");
+    soundBox.type = "checkbox";
+    soundBox.checked = !!gameFeatures.soundEnabled;
+    soundBox.addEventListener("change", () => {
+      gameFeatures.soundEnabled = !!soundBox.checked;
+      saveGameFeatures();
+    });
+
+    const soundTitle = document.createElement("span");
+    soundTitle.className = "apeha-helper-game-item-subtitle";
+    soundTitle.textContent = "Звук";
+
+    mainToggle.appendChild(mainBox);
+    mainToggle.appendChild(title);
+    soundToggle.appendChild(soundTitle);
+    soundToggle.appendChild(soundBox);
+    topRow.appendChild(mainToggle);
+    topRow.appendChild(soundToggle);
+
+    const desc = document.createElement("div");
+    desc.className = "apeha-helper-game-item-desc";
+    desc.textContent = "Подсвечивает заявку, отслеживает начало боя";
+
+    item.appendChild(topRow);
+    item.appendChild(desc);
+    gameFeatureList.appendChild(item);
   }
 
   function applySectionState() {
